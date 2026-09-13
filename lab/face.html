@@ -1,0 +1,923 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Face Scan Lab</title>
+<style>
+/* Standalone lab page. Shares no code and no stylesheet with the visualiser;
+   the tokens below mirror the CRT Phosphor theme so it feels like the product. */
+:root {
+  --bg: #000000;
+  --surface: rgba(5, 5, 12, 0.92);
+  --line: rgba(0, 255, 200, 0.22);
+  --text: #ffffff;
+  --muted: #b9c6c2;
+  --accent: #00ffc8;
+  --accent-faint: rgba(0, 255, 200, 0.12);
+  --warn: #ffb000;
+  --crit: #ff5c6c;
+  --ok: #00ffc8;
+  --mono: ui-monospace, Consolas, "Courier New", monospace;
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------- stage --- */
+
+#stage { position: fixed; inset: 0; }
+#view { display: block; width: 100%; height: 100%; }
+
+/* The CRT overlay, cheap version: static scanlines only. */
+#stage::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0 2px,
+    rgba(0, 0, 0, 0.34) 2px 3px
+  );
+  mix-blend-mode: multiply;
+  opacity: 0.5;
+}
+
+#feed {
+  position: absolute;
+  right: var(--s4);
+  bottom: var(--s4);
+  width: 132px;
+  aspect-ratio: 4 / 3;
+  max-width: 40vw;
+  object-fit: cover;
+  transform: scaleX(-1);
+  border: 1px solid var(--line);
+  background: #04121a;
+  opacity: 0.85;
+  z-index: 2;
+}
+
+/* --------------------------------------------------------------- rail --- */
+
+#rail {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: 312px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  padding: var(--s5) var(--s4);
+  overflow-y: auto;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+}
+
+.masthead h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.masthead p { margin: var(--s2) 0 0; color: var(--muted); font-size: 12px; }
+
+fieldset { margin: 0; padding: 0; border: 0; }
+legend,
+.label {
+  display: block;
+  padding: 0;
+  margin-bottom: var(--s2);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Modes are a radio group styled as a stack of rows; each carries its own cost. */
+.modes { display: flex; flex-direction: column; gap: 1px; }
+.mode {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: var(--s1) var(--s3);
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+.mode + .mode { border-top-width: 0; }
+.mode input { position: absolute; opacity: 0; pointer-events: none; }
+.mode .name { font-weight: 700; letter-spacing: 0.04em; }
+.mode .cost { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.mode .note { grid-column: 1 / -1; font-size: 11px; color: var(--muted); }
+.mode:hover { background: var(--accent-faint); }
+.mode:has(input:checked) {
+  background: var(--accent-faint);
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.mode:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.sliders { display: flex; flex-direction: column; gap: var(--s3); }
+.slider { display: grid; grid-template-columns: 1fr auto; gap: var(--s1) var(--s2); }
+.slider .label { margin: 0; }
+.slider output { font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums; }
+input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); min-height: 24px; }
+
+.actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+button, .filebtn {
+  flex: 1 1 auto;
+  min-height: 40px;
+  padding: 0 var(--s3);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  cursor: pointer;
+  text-align: center;
+}
+button:hover, .filebtn:hover { background: var(--accent-faint); }
+button:focus-visible, .filebtn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+button[disabled] { opacity: 0.4; cursor: not-allowed; }
+button[data-armed="on"] { color: var(--bg); background: var(--accent); }
+.filebtn { display: grid; place-items: center; }
+.filebtn input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+
+#status {
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--muted);
+  font-size: 11px;
+  color: var(--muted);
+}
+#status[data-tone="ok"] { border-left-color: var(--ok); color: var(--text); }
+#status[data-tone="work"] { border-left-color: var(--warn); color: var(--warn); }
+#status[data-tone="bad"] { border-left-color: var(--crit); color: var(--crit); }
+
+.footnote { margin: 0; font-size: 11px; color: var(--muted); }
+.footnote strong { color: var(--text); font-weight: 700; }
+
+/* ---------------------------------------------------------------- hud --- */
+
+#hud {
+  position: fixed;
+  top: var(--s4);
+  right: var(--s4);
+  z-index: 3;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: var(--s1) var(--s3);
+  padding: var(--s3);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 11px;
+}
+#hud dt { color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+#hud dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; color: var(--accent); }
+#hud dd[data-tone="warn"] { color: var(--warn); }
+#hud dd[data-tone="bad"] { color: var(--crit); }
+
+@media (max-width: 860px) {
+  body { overflow: auto; }
+  #rail {
+    position: static;
+    width: auto;
+    height: auto;
+    border-right: 0;
+    border-top: 1px solid var(--line);
+    margin-top: 62vh;
+  }
+  /* The stage is pinned to the top half and the rail scrolls beneath it, so
+     the readouts stay inside the stage rather than floating over the controls. */
+  #stage { position: fixed; inset: 0 0 auto; height: 62vh; z-index: 5; }
+  #hud { z-index: 6; }
+  #feed { bottom: calc(38vh + var(--s4)); width: 96px; z-index: 6; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #stage::after { display: none; }
+}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="view"></canvas>
+</div>
+<video id="feed" playsinline muted hidden></video>
+
+<dl id="hud">
+  <dt>fps</dt><dd id="m-fps">—</dd>
+  <dt>frame</dt><dd id="m-frame">—</dd>
+  <dt>puntos</dt><dd id="m-points">0</dd>
+  <dt>audio</dt><dd id="m-level">0%</dd>
+  <dt>descarga</dt><dd id="m-net">0 kB</dd>
+</dl>
+
+<aside id="rail">
+  <header class="masthead">
+    <h1>Face Scan Lab</h1>
+    <p>Banco de pruebas aislado. No comparte código con el visualizador: su propio canvas, su propio loop. Bórralo y <code>index.html</code> no cambia.</p>
+  </header>
+
+  <fieldset>
+    <legend>Modo de efecto</legend>
+    <div class="modes">
+      <label class="mode">
+        <input type="radio" name="mode" value="lum" id="mode-lum" checked>
+        <span class="name">Campo de luminancia</span>
+        <span class="cost">0 kB · sin ML</span>
+        <span class="note">Rejilla de puntos desplazada por el brillo del frame. Tu silueta se convierte en relieve.</span>
+      </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="ink" id="mode-ink">
+        <span class="name">Flujo de tinta</span>
+        <span class="cost">0 kB · sin ML</span>
+        <span class="note">Partículas que siguen el gradiente de la imagen. Es el efecto de tinta del video de Linkin Park.</span>
+      </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="face" id="mode-face">
+        <span class="name">Malla facial</span>
+        <span class="cost">≈7 MB · MediaPipe</span>
+        <span class="note">478 landmarks reales con triangulación. Al activarlo descarga runtime WASM y modelo: ≈7 MB por la red, 13 MB ya descomprimidos.</span>
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button type="button" id="cam">Activar cámara</button>
+    <button type="button" id="mic">Micrófono</button>
+    <label class="filebtn">Cargar pista<input type="file" id="file" accept="audio/*"></label>
+  </div>
+
+  <p id="status" data-tone="idle">Cámara apagada. Nada sale de tu dispositivo: el frame se procesa en memoria y nunca se sube a ningún servidor.</p>
+
+  <fieldset class="sliders">
+    <legend>Parámetros</legend>
+    <div class="slider">
+      <span class="label"><label for="depth">Profundidad</label></span>
+      <output id="depth-out">140</output>
+      <input type="range" id="depth" min="0" max="400" value="140" step="5">
+    </div>
+    <div class="slider">
+      <span class="label"><label for="react">Reacción al audio</label></span>
+      <output id="react-out">1.6</output>
+      <input type="range" id="react" min="0" max="4" value="1.6" step="0.1">
+    </div>
+    <div class="slider">
+      <span class="label"><label for="density">Densidad</label></span>
+      <output id="density-out">6 px</output>
+      <input type="range" id="density" min="3" max="16" value="6" step="1">
+    </div>
+    <div class="slider">
+      <span class="label"><label for="spin">Rotación</label></span>
+      <output id="spin-out">0.25</output>
+      <input type="range" id="spin" min="0" max="1.5" value="0.25" step="0.05">
+    </div>
+  </fieldset>
+
+  <p class="footnote"><strong>Cómo leerlo:</strong> mira los fps con la densidad al máximo. Si un modo aguanta 60 aquí, aguanta dentro del motor; si no, tampoco lo hará allí.</p>
+</aside>
+
+<audio id="track" crossorigin="anonymous"></audio>
+
+<script type="module">
+/* ===========================================================================
+   Face Scan Lab — feasibility bench for camera-driven visuals.
+
+   Three renderers share one camera, one analyser and one frame loop so the
+   numbers in the HUD are comparable. Nothing here is wired into the product;
+   the point is to decide whether it is worth wiring in at all.
+   =========================================================================== */
+
+const view = document.getElementById('view');
+const ctx = view.getContext('2d', { alpha: false, desynchronized: true });
+const feed = document.getElementById('feed');
+const track = document.getElementById('track');
+const statusEl = document.getElementById('status');
+
+const hud = {
+  fps: document.getElementById('m-fps'),
+  frame: document.getElementById('m-frame'),
+  points: document.getElementById('m-points'),
+  level: document.getElementById('m-level'),
+  net: document.getElementById('m-net'),
+};
+
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const params = { depth: 140, react: 1.6, density: 6, spin: reduceMotion ? 0 : 0.25 };
+let mode = 'lum';
+
+function say(text, tone = 'idle') {
+  statusEl.textContent = text;
+  statusEl.dataset.tone = tone;
+}
+
+/* ------------------------------------------------------------- sampling --- */
+
+/* The camera frame is never sampled at full size. A 160x120 copy is plenty for
+   a displacement field and keeps getImageData off the critical path. */
+const SAMPLE_W = 160;
+const SAMPLE_H = 120;
+const sampler = document.createElement('canvas');
+sampler.width = SAMPLE_W;
+sampler.height = SAMPLE_H;
+const sctx = sampler.getContext('2d', { willReadFrequently: true });
+
+const lum = new Float32Array(SAMPLE_W * SAMPLE_H);
+let haveFrame = false;
+
+function sampleCamera() {
+  if (!camera.live || feed.readyState < 2) return false;
+  // Mirrored, so the relief matches what you see in the monitor.
+  sctx.save();
+  sctx.scale(-1, 1);
+  sctx.drawImage(feed, -SAMPLE_W, 0, SAMPLE_W, SAMPLE_H);
+  sctx.restore();
+
+  const { data } = sctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
+  for (let i = 0, p = 0; i < lum.length; i++, p += 4) {
+    // Rec. 601 luma, normalised.
+    lum[i] = (data[p] * 0.299 + data[p + 1] * 0.587 + data[p + 2] * 0.114) / 255;
+  }
+  haveFrame = true;
+  return true;
+}
+
+const lumAt = (x, y) => lum[Math.min(SAMPLE_H - 1, y) * SAMPLE_W + Math.min(SAMPLE_W - 1, x)];
+
+/* ---------------------------------------------------------------- audio --- */
+
+const BANDS = { bass: [20, 250], mid: [250, 2000], treble: [2000, 9000] };
+
+const audio = {
+  ctx: null,
+  analyser: null,
+  freq: new Uint8Array(0),
+  ranges: null,
+  source: null,
+  micStream: null,
+  bands: { bass: 0, mid: 0, treble: 0, level: 0 },
+
+  init() {
+    if (this.ctx) return true;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return false;
+    this.ctx = new Ctor();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.analyser.smoothingTimeConstant = 0.7;
+    this.freq = new Uint8Array(this.analyser.frequencyBinCount);
+
+    const nyquist = this.ctx.sampleRate / 2;
+    const bins = this.analyser.frequencyBinCount;
+    const toBin = (hz) => Math.max(0, Math.min(bins - 1, Math.round((hz / nyquist) * bins)));
+    this.ranges = {};
+    for (const [name, [lo, hi]] of Object.entries(BANDS)) this.ranges[name] = [toBin(lo), toBin(hi)];
+    return true;
+  },
+
+  playFile(file) {
+    if (!this.init()) return;
+    this.stopMic();
+    if (!this.elementSource) {
+      this.elementSource = this.ctx.createMediaElementSource(track);
+      this.elementSource.connect(this.analyser);
+      this.analyser.connect(this.ctx.destination);
+    }
+    track.src = URL.createObjectURL(file);
+    track.play().catch(() => {});
+    this.ctx.resume().catch(() => {});
+  },
+
+  async startMic() {
+    if (!this.init()) throw new Error('Este navegador no expone Web Audio.');
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    this.stopMic();
+    track.pause();
+    this.micStream = stream;
+    this.micSource = this.ctx.createMediaStreamSource(stream);
+    // Straight into the analyser; routing a mic to the speakers would feed back.
+    this.micSource.connect(this.analyser);
+    this.ctx.resume().catch(() => {});
+  },
+
+  stopMic() {
+    this.micSource?.disconnect();
+    this.micSource = null;
+    if (this.micStream) {
+      for (const t of this.micStream.getTracks()) t.stop();
+      this.micStream = null;
+    }
+  },
+
+  sample() {
+    const b = this.bands;
+    if (!this.analyser) {
+      b.bass = b.mid = b.treble = b.level = 0;
+      return b;
+    }
+    this.analyser.getByteFrequencyData(this.freq);
+    for (const name of ['bass', 'mid', 'treble']) {
+      const [lo, hi] = this.ranges[name];
+      let sum = 0;
+      for (let i = lo; i < hi; i++) sum += this.freq[i];
+      b[name] = sum / Math.max(1, hi - lo) / 255;
+    }
+    b.level = (b.bass + b.mid + b.treble) / 3;
+    return b;
+  },
+};
+
+/* --------------------------------------------------------------- camera --- */
+
+const camera = {
+  stream: null,
+  get live() { return Boolean(this.stream); },
+
+  async start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Este navegador no expone getUserMedia. Recuerda que la cámara exige HTTPS o localhost.');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+    this.stream = stream;
+    feed.srcObject = stream;
+    feed.hidden = false;
+    await feed.play().catch(() => {});
+  },
+
+  stop() {
+    for (const t of this.stream?.getTracks() ?? []) t.stop();
+    this.stream = null;
+    feed.srcObject = null;
+    feed.hidden = true;
+    haveFrame = false;
+    lum.fill(0);
+  },
+};
+
+/* ============================ mode 1: luminance field ==================== */
+/* One point per grid cell, pushed along z by the cell's brightness, then
+   projected. Points are bucketed by depth and filled as four Path2Ds, which is
+   the same trick renderer.js uses to keep the draw-call count down. */
+
+const FOV = 520;
+const BUCKETS = 4;
+const bucketPaths = Array.from({ length: BUCKETS }, () => new Path2D());
+
+function drawLuminance(w, h, bands, t) {
+  const step = params.density;
+  const cols = Math.floor(SAMPLE_W / 1);
+  const gain = 1 + bands.level * params.react;
+  const depth = params.depth * gain;
+  const spin = params.spin * t * 0.0004;
+  const cos = Math.cos(spin);
+  const sin = Math.sin(spin);
+
+  // Path2D has no reset, so the buckets are rebuilt each frame.
+  for (let i = 0; i < BUCKETS; i++) bucketPaths[i] = new Path2D();
+
+  const spanX = Math.min(w, h * (4 / 3)) * 0.82;
+  const spanY = spanX * 0.75;
+  const cx = w / 2;
+  const cy = h / 2;
+  const cell = Math.max(1, (spanX / SAMPLE_W) * step * 0.9);
+  let drawn = 0;
+
+  for (let gy = 0; gy < SAMPLE_H; gy += step) {
+    for (let gx = 0; gx < SAMPLE_W; gx += step) {
+      const l = lumAt(gx, gy);
+      if (l < 0.08) continue; // Skip the dead black of a dim room.
+
+      // Normalised model space, centred on the origin.
+      const nx = (gx / SAMPLE_W - 0.5) * 2;
+      const ny = (gy / SAMPLE_H - 0.5) * 2;
+      const nz = (l - 0.5) * 2;
+
+      // Rotate about Y so the relief reads as geometry, not a flat filter.
+      const rx = nx * cos + nz * sin;
+      const rz = nz * cos - nx * sin;
+
+      const persp = FOV / (FOV + rz * depth);
+      const x = cx + rx * spanX * 0.5 * persp;
+      const y = cy + ny * spanY * 0.5 * persp;
+
+      const size = cell * persp * (0.4 + l * 0.8);
+      const bucket = Math.min(BUCKETS - 1, (l * BUCKETS) | 0);
+      bucketPaths[bucket].rect(x - size / 2, y - size / 2, size, size);
+      drawn++;
+    }
+  }
+
+  for (let i = 0; i < BUCKETS; i++) {
+    const k = i / (BUCKETS - 1);
+    ctx.fillStyle = `rgba(${Math.round(0 + k * 120)}, 255, ${Math.round(200 - k * 60)}, ${0.25 + k * 0.7})`;
+    ctx.fill(bucketPaths[i]);
+  }
+  return drawn;
+}
+
+/* ================================ mode 2: ink flow ====================== */
+/* Particles advected by the luminance gradient, with trails from a partial
+   clear instead of stored history. Cheap, and it is the closest thing here to
+   the liquid-ink passages in the reference video. */
+
+const INK_MAX = 2600;
+const ink = { x: new Float32Array(INK_MAX), y: new Float32Array(INK_MAX), age: new Float32Array(INK_MAX) };
+let inkSeeded = false;
+
+function seedInk() {
+  for (let i = 0; i < INK_MAX; i++) respawn(i);
+  inkSeeded = true;
+}
+function respawn(i) {
+  ink.x[i] = Math.random() * SAMPLE_W;
+  ink.y[i] = Math.random() * SAMPLE_H;
+  ink.age[i] = Math.random() * 120;
+}
+
+function drawInk(w, h, bands) {
+  if (!inkSeeded) seedInk();
+  const count = Math.round(INK_MAX * (0.25 + (17 - params.density) / 17 * 0.75));
+  const speed = 0.6 + bands.level * params.react * 2.4;
+
+  const spanX = Math.min(w, h * (4 / 3)) * 0.9;
+  const spanY = spanX * 0.75;
+  const ox = (w - spanX) / 2;
+  const oy = (h - spanY) / 2;
+  const sx = spanX / SAMPLE_W;
+  const sy = spanY / SAMPLE_H;
+
+  const path = new Path2D();
+  for (let i = 0; i < count; i++) {
+    const x = ink.x[i];
+    const y = ink.y[i];
+    const gxi = x | 0;
+    const gyi = y | 0;
+
+    // Central difference on the luma field; particles slide along the contour
+    // (perpendicular to the gradient) so they trace edges instead of pooling.
+    const gradX = lumAt(gxi + 1, gyi) - lumAt(Math.max(0, gxi - 1), gyi);
+    const gradY = lumAt(gxi, gyi + 1) - lumAt(gxi, Math.max(0, gyi - 1));
+    const mag = Math.hypot(gradX, gradY) || 1e-4;
+
+    const nx2 = -gradY / mag;
+    const ny2 = gradX / mag;
+    const drift = Math.min(1, mag * 6);
+
+    ink.x[i] += (nx2 * drift + (Math.random() - 0.5) * 0.5) * speed;
+    ink.y[i] += (ny2 * drift + (Math.random() - 0.5) * 0.5) * speed;
+    ink.age[i] += 1;
+
+    if (ink.age[i] > 160 || ink.x[i] < 0 || ink.x[i] >= SAMPLE_W || ink.y[i] < 0 || ink.y[i] >= SAMPLE_H) {
+      respawn(i);
+      continue;
+    }
+
+    const r = 0.6 + lumAt(gxi, gyi) * (1.6 + params.depth / 160);
+    path.moveTo(ox + ink.x[i] * sx + r, oy + ink.y[i] * sy);
+    path.arc(ox + ink.x[i] * sx, oy + ink.y[i] * sy, r, 0, Math.PI * 2);
+  }
+
+  ctx.fillStyle = `rgba(0, 255, 200, ${0.1 + bands.level * 0.5})`;
+  ctx.fill(path);
+  return count;
+}
+
+/* =============================== mode 3: face mesh ====================== */
+/* MediaPipe Face Landmarker, loaded on demand from jsDelivr. The whole point of
+   this mode is to find out what it costs: bytes, load time and frame budget. */
+
+const MP_VERSION = '0.10.14';
+const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+const MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+
+const face = {
+  state: 'idle', // idle | loading | ready | failed
+  landmarker: null,
+  tesselation: null,
+  result: null,
+  lastVideoTime: -1,
+  bytes: 0,
+
+  async load() {
+    if (this.state === 'loading' || this.state === 'ready') return;
+    this.state = 'loading';
+    say('Descargando MediaPipe (≈7 MB): runtime WASM y modelo de 478 landmarks…', 'work');
+    const started = performance.now();
+    try {
+      const vision = await import(`${MP_BASE}/vision_bundle.mjs`);
+      const fileset = await vision.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
+      this.landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+      });
+      this.tesselation = vision.FaceLandmarker.FACE_LANDMARKS_TESSELATION ?? null;
+      this.state = 'ready';
+      this.bytes = await measureTransfer();
+      const secs = ((performance.now() - started) / 1000).toFixed(1);
+      say(`Malla facial lista en ${secs} s. Compara los fps con los modos sin ML.`, 'ok');
+    } catch (err) {
+      this.state = 'failed';
+      say(`MediaPipe no cargó: ${err?.message ?? err}. Los modos sin ML siguen funcionando.`, 'bad');
+    }
+  },
+
+  detect(nowMs) {
+    if (this.state !== 'ready' || !camera.live || feed.readyState < 2) return;
+    if (feed.currentTime === this.lastVideoTime) return; // No new camera frame yet.
+    this.lastVideoTime = feed.currentTime;
+    try {
+      this.result = this.landmarker.detectForVideo(feed, nowMs);
+    } catch {
+      this.result = null;
+    }
+  },
+};
+
+/* Rough transfer total for the HUD, from the Resource Timing entries MediaPipe
+   created. encodedBodySize is 0 for opaque cross-origin responses, so this is a
+   floor, not a promise. */
+async function measureTransfer() {
+  let total = 0;
+  for (const entry of performance.getEntriesByType('resource')) {
+    if (entry.name.includes('tasks-vision') || entry.name.includes('mediapipe-models')) {
+      total += entry.transferSize || entry.encodedBodySize || 0;
+    }
+  }
+  return total;
+}
+
+function drawFace(w, h, bands, t) {
+  const marks = face.result?.faceLandmarks?.[0];
+  if (!marks) return 0;
+
+  const gain = 1 + bands.level * params.react;
+  const depth = params.depth * gain;
+  const spin = params.spin * t * 0.0004;
+  const cos = Math.cos(spin);
+  const sin = Math.sin(spin);
+
+  const span = Math.min(w, h) * 0.95;
+  const cx = w / 2;
+  const cy = h / 2;
+
+  // Landmarks arrive in normalised image space; recentre so the head sits at
+  // the origin before rotating, or it swings around the corner of the frame.
+  const n = marks.length;
+  const flat = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const m = marks[i];
+    const nx = (0.5 - m.x) * 2; // mirrored
+    const ny = (m.y - 0.5) * 2;
+    // m.z is roughly in the same units as x; push vertices out along it and
+    // let the bass exaggerate the relief.
+    const nz = m.z * 2.2 * (1 + bands.bass * params.react * 0.8);
+
+    const rx = nx * cos + nz * sin;
+    const rz = nz * cos - nx * sin;
+    const persp = FOV / (FOV + rz * depth);
+    flat[i * 2] = cx + rx * span * 0.5 * persp;
+    flat[i * 2 + 1] = cy + ny * span * 0.5 * persp;
+  }
+
+  if (face.tesselation) {
+    const path = new Path2D();
+    for (const conn of face.tesselation) {
+      const a = conn.start ?? conn[0];
+      const b = conn.end ?? conn[1];
+      if (a >= n || b >= n) continue;
+      path.moveTo(flat[a * 2], flat[a * 2 + 1]);
+      path.lineTo(flat[b * 2], flat[b * 2 + 1]);
+    }
+    ctx.strokeStyle = `rgba(0, 255, 200, ${0.2 + bands.level * 0.55})`;
+    ctx.lineWidth = 1;
+    ctx.stroke(path);
+  }
+
+  const dots = new Path2D();
+  const r = 1 + bands.treble * params.react * 1.6;
+  for (let i = 0; i < n; i++) {
+    dots.moveTo(flat[i * 2] + r, flat[i * 2 + 1]);
+    dots.arc(flat[i * 2], flat[i * 2 + 1], r, 0, Math.PI * 2);
+  }
+  ctx.fillStyle = `rgba(180, 255, 235, ${0.5 + bands.level * 0.4})`;
+  ctx.fill(dots);
+
+  return n;
+}
+
+/* ----------------------------------------------------------------- loop --- */
+
+let dpr = 1;
+function resize() {
+  const rect = view.getBoundingClientRect();
+  dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  view.width = Math.max(1, Math.round(rect.width * dpr));
+  view.height = Math.max(1, Math.round(rect.height * dpr));
+}
+resize();
+addEventListener('resize', resize);
+
+let frames = 0;
+let fpsWindow = 0;
+let frameCost = 16;
+let points = 0;
+
+function tone(el, value, warnAt, badAt) {
+  el.dataset.tone = value <= badAt ? 'bad' : value <= warnAt ? 'warn' : 'ok';
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(64, now - last);
+  last = now;
+
+  const w = view.width;
+  const h = view.height;
+  const bands = audio.sample();
+
+  sampleCamera();
+  if (mode === 'face') face.detect(now);
+
+  // Trails for ink, a hard clear for the other two.
+  if (mode === 'ink') {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.14)';
+    ctx.fillRect(0, 0, w, h);
+  } else {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  if (!camera.live) {
+    drawIdle(w, h, now);
+    points = 0;
+  } else if (mode === 'lum') {
+    points = drawLuminance(w, h, bands, now);
+  } else if (mode === 'ink') {
+    points = drawInk(w, h, bands);
+  } else {
+    points = drawFace(w, h, bands, now);
+    if (face.state === 'ready' && points === 0) drawHint(w, h, 'Buscando un rostro…');
+  }
+
+  // Telemetry.
+  frameCost += (dt - frameCost) * 0.1;
+  frames++;
+  fpsWindow += dt;
+  if (fpsWindow >= 500) {
+    const fps = Math.round((frames * 1000) / fpsWindow);
+    hud.fps.textContent = fps;
+    tone(hud.fps, fps, 45, 25);
+    hud.frame.textContent = `${frameCost.toFixed(1)} ms`;
+    frames = 0;
+    fpsWindow = 0;
+  }
+  hud.points.textContent = points.toLocaleString('es');
+  hud.level.textContent = `${Math.round(bands.level * 100)}%`;
+  hud.net.textContent = face.bytes ? `${(face.bytes / 1_048_576).toFixed(1)} MB` : '0 kB';
+
+  requestAnimationFrame(frame);
+}
+
+/* The page must show something before any permission is granted, so the idle
+   state is a synthetic head: a lissajous lattice standing in for the mesh. */
+function drawIdle(w, h, t) {
+  const span = Math.min(w, h) * 0.42;
+  const cx = w / 2;
+  const cy = h / 2;
+  const wob = reduceMotion ? 0 : Math.sin(t * 0.0006) * 0.25;
+  const path = new Path2D();
+  for (let i = 0; i < 240; i++) {
+    const a = (i / 240) * Math.PI * 2;
+    const r = span * (0.7 + 0.25 * Math.sin(a * 3 + wob * 4));
+    const x = cx + Math.cos(a) * r;
+    const y = cy + Math.sin(a) * r * 1.18;
+    if (i === 0) path.moveTo(x, y);
+    else path.lineTo(x, y);
+  }
+  path.closePath();
+  ctx.strokeStyle = 'rgba(0, 255, 200, 0.28)';
+  ctx.lineWidth = 1;
+  ctx.stroke(path);
+  drawHint(w, h, 'Activa la cámara para empezar');
+}
+
+function drawHint(w, h, text) {
+  ctx.fillStyle = 'rgba(185, 198, 194, 0.75)';
+  ctx.font = `${Math.round(13 * dpr)}px ui-monospace, monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText(text, w / 2, h - 28 * dpr);
+  ctx.textAlign = 'start';
+}
+
+requestAnimationFrame(frame);
+
+/* ------------------------------------------------------------- controls --- */
+
+for (const input of document.querySelectorAll('input[name="mode"]')) {
+  input.addEventListener('change', () => {
+    mode = input.value;
+    if (mode === 'face' && face.state === 'idle') face.load();
+    else if (mode === 'face' && face.state === 'failed') face.load();
+  });
+}
+
+const bindSlider = (id, key, format) => {
+  const el = document.getElementById(id);
+  const out = document.getElementById(`${id}-out`);
+  const sync = () => {
+    params[key] = Number(el.value);
+    out.textContent = format(params[key]);
+  };
+  el.addEventListener('input', sync);
+  sync();
+};
+bindSlider('depth', 'depth', (v) => String(v));
+bindSlider('react', 'react', (v) => v.toFixed(1));
+bindSlider('density', 'density', (v) => `${v} px`);
+bindSlider('spin', 'spin', (v) => v.toFixed(2));
+
+const camBtn = document.getElementById('cam');
+camBtn.addEventListener('click', async () => {
+  if (camera.live) {
+    camera.stop();
+    camBtn.textContent = 'Activar cámara';
+    camBtn.dataset.armed = 'off';
+    say('Cámara apagada. La pista de video quedó detenida.', 'idle');
+    return;
+  }
+  camBtn.disabled = true;
+  try {
+    await camera.start();
+    camBtn.textContent = 'Apagar cámara';
+    camBtn.dataset.armed = 'on';
+    say('Cámara encendida. Todo el procesamiento ocurre en esta pestaña; ningún frame se envía a la red.', 'ok');
+    if (mode === 'face' && face.state === 'idle') face.load();
+  } catch (err) {
+    say(`No se pudo abrir la cámara: ${err?.message ?? err}`, 'bad');
+  } finally {
+    camBtn.disabled = false;
+  }
+});
+
+const micBtn = document.getElementById('mic');
+micBtn.addEventListener('click', async () => {
+  try {
+    if (audio.micStream) {
+      audio.stopMic();
+      micBtn.dataset.armed = 'off';
+      micBtn.textContent = 'Micrófono';
+      return;
+    }
+    await audio.startMic();
+    micBtn.dataset.armed = 'on';
+    micBtn.textContent = 'Cortar micro';
+  } catch (err) {
+    say(`Micrófono no disponible: ${err?.message ?? err}`, 'bad');
+  }
+});
+
+document.getElementById('file').addEventListener('change', (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  audio.playFile(file);
+  micBtn.dataset.armed = 'off';
+  micBtn.textContent = 'Micrófono';
+  say(`Reproduciendo ${file.name}. Sube la reacción al audio para ver el efecto responder.`, 'ok');
+});
+
+addEventListener('pagehide', () => {
+  camera.stop();
+  audio.stopMic();
+});
+</script>
+</body>
+</html>
