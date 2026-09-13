@@ -262,6 +262,12 @@ button[data-armed="on"] { color: var(--bg); background: var(--accent); }
         <span class="cost">≈7 MB · MediaPipe</span>
         <span class="note">478 landmarks reales con triangulación. Al activarlo descarga runtime WASM y modelo: ≈7 MB por la red, 13 MB ya descomprimidos.</span>
       </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="combo" id="mode-combo">
+        <span class="name">Tinta sobre el rostro</span>
+        <span class="cost">≈7 MB · MediaPipe</span>
+        <span class="note">Las dos juntas: el óvalo de la cara es el molde y la tinta corre dentro antes de derramarse por la mandíbula.</span>
+      </label>
     </div>
   </fieldset>
 
@@ -347,8 +353,11 @@ sampler.height = SAMPLE_H;
 const sctx = sampler.getContext('2d', { willReadFrequently: true });
 
 const lum = new Float32Array(SAMPLE_W * SAMPLE_H);
+let rgba = null;
 let haveFrame = false;
 
+/* Only the modes that read pixels pay for the readback. The face mesh feeds on
+   the video element directly, so sampling for it was pure waste. */
 function sampleCamera() {
   if (!camera.live || feed.readyState < 2) return false;
   // Mirrored, so the relief matches what you see in the monitor.
@@ -357,10 +366,11 @@ function sampleCamera() {
   sctx.drawImage(feed, -SAMPLE_W, 0, SAMPLE_W, SAMPLE_H);
   sctx.restore();
 
-  const { data } = sctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
+  const image = sctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
+  rgba = image.data;
   for (let i = 0, p = 0; i < lum.length; i++, p += 4) {
     // Rec. 601 luma, normalised.
-    lum[i] = (data[p] * 0.299 + data[p + 1] * 0.587 + data[p + 2] * 0.114) / 255;
+    lum[i] = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
   }
   haveFrame = true;
   return true;
@@ -618,13 +628,23 @@ const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSI
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
+/* Inference runs far below the render rate and the landmarks are eased toward
+   each new result, so the mesh reads as 60 fps motion at a third of the cost. */
+const DETECT_INTERVAL = 45; // ms, about 22 detections per second
+const EASE = 0.4;
+
 const face = {
   state: 'idle', // idle | loading | ready | failed
   landmarker: null,
   tesselation: null,
+  oval: null,
   result: null,
   lastVideoTime: -1,
+  lastDetect: 0,
   bytes: 0,
+  // Eased landmark positions in normalised image space, xyz per vertex.
+  smooth: null,
+  tracking: false,
 
   async load() {
     if (this.state === 'loading' || this.state === 'ready') return;
@@ -640,6 +660,7 @@ const face = {
         numFaces: 1,
       });
       this.tesselation = vision.FaceLandmarker.FACE_LANDMARKS_TESSELATION ?? null;
+      this.oval = vision.FaceLandmarker.FACE_LANDMARKS_FACE_OVAL ?? null;
       this.state = 'ready';
       this.bytes = await measureTransfer();
       const secs = ((performance.now() - started) / 1000).toFixed(1);
@@ -652,15 +673,103 @@ const face = {
 
   detect(nowMs) {
     if (this.state !== 'ready' || !camera.live || feed.readyState < 2) return;
-    if (feed.currentTime === this.lastVideoTime) return; // No new camera frame yet.
+    if (nowMs - this.lastDetect < DETECT_INTERVAL) return; // Below the render rate on purpose.
+    if (feed.currentTime === this.lastVideoTime) return;   // No new camera frame yet.
+    this.lastDetect = nowMs;
     this.lastVideoTime = feed.currentTime;
     try {
       this.result = this.landmarker.detectForVideo(feed, nowMs);
     } catch {
       this.result = null;
     }
+    this.ease();
+    if (mode === 'combo') buildFaceMask();
+  },
+
+  /** Move the held positions a fraction of the way toward the new detection. */
+  ease() {
+    const marks = this.result?.faceLandmarks?.[0];
+    if (!marks) {
+      this.tracking = false;
+      return;
+    }
+    const n = marks.length;
+    if (!this.smooth || this.smooth.length !== n * 3) {
+      this.smooth = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        this.smooth[i * 3] = marks[i].x;
+        this.smooth[i * 3 + 1] = marks[i].y;
+        this.smooth[i * 3 + 2] = marks[i].z;
+      }
+    } else {
+      for (let i = 0; i < n; i++) {
+        const j = i * 3;
+        this.smooth[j] += (marks[i].x - this.smooth[j]) * EASE;
+        this.smooth[j + 1] += (marks[i].y - this.smooth[j + 1]) * EASE;
+        this.smooth[j + 2] += (marks[i].z - this.smooth[j + 2]) * EASE;
+      }
+    }
+    this.tracking = true;
   },
 };
+
+/* --------------------------------------------------------- projection --- */
+
+/* Landmarks are normalised against the frame's width and height separately, so
+   projecting both axes through one scale stretches the face by the camera's
+   aspect ratio. Width sets the scale; height follows from the aspect. */
+function faceProjection(w, h) {
+  const aspect = (feed.videoWidth || 4) / (feed.videoHeight || 3);
+  const fit = Math.min(w / aspect, h) * 0.95;
+  return { sx: fit * aspect * 0.5, sy: fit * 0.5, cx: w / 2, cy: h / 2 };
+}
+
+/* Screen positions for the eased landmarks, written into `out` as xy pairs and
+   returned with the depth range so callers can shade by it. */
+const projected = { xy: new Float32Array(0), depth: new Float32Array(0), min: 0, max: 0, n: 0 };
+
+function projectFace(w, h, bands, t) {
+  const s = face.smooth;
+  if (!s || !face.tracking) return null;
+
+  const n = s.length / 3;
+  if (projected.xy.length !== n * 2) {
+    projected.xy = new Float32Array(n * 2);
+    projected.depth = new Float32Array(n);
+  }
+
+  const { sx, sy, cx, cy } = faceProjection(w, h);
+  // MediaPipe's z is roughly in the same units as x, and it is subtle by
+  // design. Scale it gently or the mesh turns inside out.
+  const relief = 0.6 + bands.bass * params.react * 0.5;
+  const zoom = params.depth / 140;
+  const spin = params.spin * t * 0.0004;
+  const cos = Math.cos(spin);
+  const sin = Math.sin(spin);
+
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const j = i * 3;
+    const nx = (0.5 - s[j]) * 2; // mirrored, matching the monitor
+    const ny = (s[j + 1] - 0.5) * 2;
+    const nz = s[j + 2] * 2 * relief;
+
+    const rx = nx * cos + nz * sin;
+    const rz = nz * cos - nx * sin;
+
+    const persp = FOV / (FOV + rz * 180 * zoom);
+    projected.xy[i * 2] = cx + rx * sx * persp;
+    projected.xy[i * 2 + 1] = cy + ny * sy * persp;
+    projected.depth[i] = rz;
+    if (rz < min) min = rz;
+    if (rz > max) max = rz;
+  }
+  projected.n = n;
+  projected.min = min;
+  projected.max = max === min ? min + 1e-3 : max;
+  return projected;
+}
 
 /* Rough transfer total for the HUD, from the Resource Timing entries MediaPipe
    created. encodedBodySize is 0 for opaque cross-origin responses, so this is a
@@ -675,63 +784,233 @@ async function measureTransfer() {
   return total;
 }
 
+/* Lines are bucketed by depth and stroked once per bucket: far edges go dim and
+   thin, near edges bright and thick. That contrast is what reads as volume —
+   a wireframe drawn in one flat colour reads as an X-ray. */
+const DEPTH_BUCKETS = 5;
+
 function drawFace(w, h, bands, t) {
-  const marks = face.result?.faceLandmarks?.[0];
-  if (!marks) return 0;
+  const proj = projectFace(w, h, bands, t);
+  if (!proj) return 0;
 
-  const gain = 1 + bands.level * params.react;
-  const depth = params.depth * gain;
-  const spin = params.spin * t * 0.0004;
-  const cos = Math.cos(spin);
-  const sin = Math.sin(spin);
-
-  const span = Math.min(w, h) * 0.95;
-  const cx = w / 2;
-  const cy = h / 2;
-
-  // Landmarks arrive in normalised image space; recentre so the head sits at
-  // the origin before rotating, or it swings around the corner of the frame.
-  const n = marks.length;
-  const flat = new Float32Array(n * 2);
-  for (let i = 0; i < n; i++) {
-    const m = marks[i];
-    const nx = (0.5 - m.x) * 2; // mirrored
-    const ny = (m.y - 0.5) * 2;
-    // m.z is roughly in the same units as x; push vertices out along it and
-    // let the bass exaggerate the relief.
-    const nz = m.z * 2.2 * (1 + bands.bass * params.react * 0.8);
-
-    const rx = nx * cos + nz * sin;
-    const rz = nz * cos - nx * sin;
-    const persp = FOV / (FOV + rz * depth);
-    flat[i * 2] = cx + rx * span * 0.5 * persp;
-    flat[i * 2 + 1] = cy + ny * span * 0.5 * persp;
-  }
+  const { xy, depth, min, max, n } = proj;
+  const span = max - min;
 
   if (face.tesselation) {
-    const path = new Path2D();
+    const buckets = Array.from({ length: DEPTH_BUCKETS }, () => new Path2D());
     for (const conn of face.tesselation) {
       const a = conn.start ?? conn[0];
       const b = conn.end ?? conn[1];
       if (a >= n || b >= n) continue;
-      path.moveTo(flat[a * 2], flat[a * 2 + 1]);
-      path.lineTo(flat[b * 2], flat[b * 2 + 1]);
+      // Nearer vertices have a smaller z, so invert to get "closeness".
+      const near = 1 - ((depth[a] + depth[b]) / 2 - min) / span;
+      const bucket = Math.min(DEPTH_BUCKETS - 1, (near * DEPTH_BUCKETS) | 0);
+      buckets[bucket].moveTo(xy[a * 2], xy[a * 2 + 1]);
+      buckets[bucket].lineTo(xy[b * 2], xy[b * 2 + 1]);
     }
-    ctx.strokeStyle = `rgba(0, 255, 200, ${0.2 + bands.level * 0.55})`;
-    ctx.lineWidth = 1;
-    ctx.stroke(path);
+    for (let i = 0; i < DEPTH_BUCKETS; i++) {
+      const k = i / (DEPTH_BUCKETS - 1);
+      ctx.strokeStyle = `rgba(${Math.round(30 + k * 150)}, 255, ${Math.round(210 - k * 40)}, ${0.08 + k * (0.32 + bands.level * 0.4)})`;
+      ctx.lineWidth = 0.5 + k * 1.1;
+      ctx.stroke(buckets[i]);
+    }
   }
 
   const dots = new Path2D();
-  const r = 1 + bands.treble * params.react * 1.6;
+  const r = 0.8 + bands.treble * params.react * 1.4;
   for (let i = 0; i < n; i++) {
-    dots.moveTo(flat[i * 2] + r, flat[i * 2 + 1]);
-    dots.arc(flat[i * 2], flat[i * 2 + 1], r, 0, Math.PI * 2);
+    const near = 1 - (depth[i] - min) / span;
+    if (near < 0.45) continue; // Only the front of the head keeps its points.
+    dots.moveTo(xy[i * 2] + r, xy[i * 2 + 1]);
+    dots.arc(xy[i * 2], xy[i * 2 + 1], r, 0, Math.PI * 2);
   }
-  ctx.fillStyle = `rgba(180, 255, 235, ${0.5 + bands.level * 0.4})`;
+  ctx.fillStyle = `rgba(200, 255, 240, ${0.4 + bands.level * 0.4})`;
   ctx.fill(dots);
 
   return n;
+}
+
+/* ============================= mode 4: ink on the face =================== */
+/* The two ideas joined: the face oval becomes a stencil, and ink flows inside
+   it along the curl of a noise field before spilling over the jaw. */
+
+/* A mask at sampling resolution, refilled on each detection. Testing a point
+   against a polygon per particle per frame would cost far more than one fill. */
+const maskCanvas = document.createElement('canvas');
+maskCanvas.width = SAMPLE_W;
+maskCanvas.height = SAMPLE_H;
+const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+const mask = new Uint8Array(SAMPLE_W * SAMPLE_H);
+let maskReady = false;
+
+function buildFaceMask() {
+  const s = face.smooth;
+  if (!s || !face.oval) return;
+
+  mctx.clearRect(0, 0, SAMPLE_W, SAMPLE_H);
+  mctx.fillStyle = '#fff';
+  mctx.beginPath();
+  let first = true;
+  for (const conn of face.oval) {
+    const a = conn.start ?? conn[0];
+    // Mirrored to match the sampled frame, which is mirrored too.
+    const x = (1 - s[a * 3]) * SAMPLE_W;
+    const y = s[a * 3 + 1] * SAMPLE_H;
+    if (first) { mctx.moveTo(x, y); first = false; }
+    else mctx.lineTo(x, y);
+  }
+  mctx.closePath();
+  mctx.fill();
+
+  const { data } = mctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
+  for (let i = 0, p = 3; i < mask.length; i++, p += 4) mask[i] = data[p] > 120 ? 1 : 0;
+  maskReady = true;
+}
+
+const inFace = (x, y) => {
+  const xi = x | 0;
+  const yi = y | 0;
+  if (xi < 0 || yi < 0 || xi >= SAMPLE_W || yi >= SAMPLE_H) return 0;
+  return mask[yi * SAMPLE_W + xi];
+};
+
+/* Cheap value noise. Two offset samples give a divergence-free (curl) field,
+   which is what makes the drift look like liquid instead of drifting dust. */
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+  return s - Math.floor(s);
+}
+function valueNoise(x, y) {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const xf = x - xi;
+  const yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi);
+  const b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1);
+  const d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function curl(x, y, out) {
+  const e = 0.6;
+  const n1 = valueNoise(x, y + e);
+  const n2 = valueNoise(x, y - e);
+  const n3 = valueNoise(x + e, y);
+  const n4 = valueNoise(x - e, y);
+  out[0] = (n1 - n2) / (2 * e);
+  out[1] = -(n3 - n4) / (2 * e);
+}
+
+const COMBO_MAX = 3000;
+const combo = {
+  x: new Float32Array(COMBO_MAX),
+  y: new Float32Array(COMBO_MAX),
+  vx: new Float32Array(COMBO_MAX),
+  vy: new Float32Array(COMBO_MAX),
+  age: new Float32Array(COMBO_MAX),
+  life: new Float32Array(COMBO_MAX),
+  seeded: false,
+};
+const curlOut = [0, 0];
+
+function seedCombo(i) {
+  // Rejection-sample inside the stencil so ink is born on the face, not around it.
+  for (let tries = 0; tries < 12; tries++) {
+    const x = Math.random() * SAMPLE_W;
+    const y = Math.random() * SAMPLE_H;
+    if (inFace(x, y)) {
+      combo.x[i] = x;
+      combo.y[i] = y;
+      combo.vx[i] = 0;
+      combo.vy[i] = 0;
+      combo.age[i] = 0;
+      combo.life[i] = 60 + Math.random() * 120;
+      return;
+    }
+  }
+  combo.life[i] = 0; // No face yet; try again next frame.
+  combo.age[i] = 1;
+}
+
+function drawCombo(w, h, bands, t) {
+  if (!maskReady || !face.tracking) return 0;
+  if (!combo.seeded) {
+    for (let i = 0; i < COMBO_MAX; i++) seedCombo(i);
+    combo.seeded = true;
+  }
+
+  const count = Math.round(COMBO_MAX * (0.3 + (17 - params.density) / 17 * 0.7));
+  const flow = 0.35 + bands.level * params.react * 0.9;
+  const drip = 0.05 + bands.bass * params.react * 0.35; // Bass makes the ink run.
+  const noiseScale = 0.05;
+  const drag = 0.86;
+
+  const { sx, sy, cx, cy } = faceProjection(w, h);
+  const toScreenX = (x) => cx + ((0.5 - x / SAMPLE_W) * 2) * sx;
+  const toScreenY = (y) => cy + ((y / SAMPLE_H - 0.5) * 2) * sy;
+
+  ctx.lineCap = 'round';
+  let alive = 0;
+
+  for (let i = 0; i < count; i++) {
+    if (combo.life[i] <= 0 || combo.age[i] > combo.life[i]) {
+      seedCombo(i);
+      continue;
+    }
+
+    const px = combo.x[i];
+    const py = combo.y[i];
+
+    curl(px * noiseScale, py * noiseScale + t * 0.0004, curlOut);
+
+    // Inside the stencil the ink also hugs the features; outside it just falls.
+    const held = inFace(px, py);
+    let ax = curlOut[0] * flow;
+    let ay = curlOut[1] * flow + drip;
+    if (held) {
+      const gx = lumAt((px | 0) + 1, py | 0) - lumAt(Math.max(0, (px | 0) - 1), py | 0);
+      const gy = lumAt(px | 0, (py | 0) + 1) - lumAt(px | 0, Math.max(0, (py | 0) - 1));
+      const mag = Math.hypot(gx, gy) || 1e-4;
+      ax += (-gy / mag) * Math.min(1, mag * 5) * flow;
+      ay += (gx / mag) * Math.min(1, mag * 5) * flow;
+    }
+
+    // Velocity carried between frames is what turns crawling dots into ribbons.
+    combo.vx[i] = combo.vx[i] * drag + ax;
+    combo.vy[i] = combo.vy[i] * drag + ay;
+    combo.x[i] += combo.vx[i];
+    combo.y[i] += combo.vy[i];
+    combo.age[i] += 1;
+
+    if (combo.x[i] < 0 || combo.x[i] >= SAMPLE_W || combo.y[i] < 0 || combo.y[i] >= SAMPLE_H) {
+      seedCombo(i);
+      continue;
+    }
+
+    // Ink that has left the face fades as it falls, so the spill has an edge.
+    const fade = held ? 1 : 0.45;
+    const remaining = 1 - combo.age[i] / combo.life[i];
+
+    let colour;
+    if (rgba) {
+      const o = ((combo.y[i] | 0) * SAMPLE_W + (combo.x[i] | 0)) * 4;
+      colour = `rgba(${rgba[o]}, ${rgba[o + 1]}, ${rgba[o + 2]}, ${(0.25 + bands.level * 0.5) * fade * remaining})`;
+    } else {
+      colour = `rgba(0, 255, 200, ${0.3 * fade * remaining})`;
+    }
+
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = (0.6 + bands.treble * params.react) * fade;
+    ctx.beginPath();
+    ctx.moveTo(toScreenX(px), toScreenY(py));
+    ctx.lineTo(toScreenX(combo.x[i]), toScreenY(combo.y[i]));
+    ctx.stroke();
+    alive++;
+  }
+
+  return alive;
 }
 
 /* ----------------------------------------------------------------- loop --- */
@@ -764,11 +1043,12 @@ function frame(now) {
   const h = view.height;
   const bands = audio.sample();
 
-  sampleCamera();
-  if (mode === 'face') face.detect(now);
+  // The mesh alone reads the video element directly and needs no readback.
+  if (mode !== 'face') sampleCamera();
+  if (mode === 'face' || mode === 'combo') face.detect(now);
 
-  // Trails for ink, a hard clear for the other two.
-  if (mode === 'ink') {
+  // Trails for the flowing modes, a hard clear for the rest.
+  if (mode === 'ink' || mode === 'combo') {
     ctx.fillStyle = 'rgba(0, 0, 0, 0.14)';
     ctx.fillRect(0, 0, w, h);
   } else {
@@ -783,6 +1063,9 @@ function frame(now) {
     points = drawLuminance(w, h, bands, now);
   } else if (mode === 'ink') {
     points = drawInk(w, h, bands);
+  } else if (mode === 'combo') {
+    points = drawCombo(w, h, bands, now);
+    if (face.state === 'ready' && !face.tracking) drawHint(w, h, 'Buscando un rostro…');
   } else {
     points = drawFace(w, h, bands, now);
     if (face.state === 'ready' && points === 0) drawHint(w, h, 'Buscando un rostro…');
@@ -845,8 +1128,8 @@ requestAnimationFrame(frame);
 for (const input of document.querySelectorAll('input[name="mode"]')) {
   input.addEventListener('change', () => {
     mode = input.value;
-    if (mode === 'face' && face.state === 'idle') face.load();
-    else if (mode === 'face' && face.state === 'failed') face.load();
+    const needsMesh = mode === 'face' || mode === 'combo';
+    if (needsMesh && (face.state === 'idle' || face.state === 'failed')) face.load();
   });
 }
 
@@ -880,7 +1163,7 @@ camBtn.addEventListener('click', async () => {
     camBtn.textContent = 'Apagar cámara';
     camBtn.dataset.armed = 'on';
     say('Cámara encendida. Todo el procesamiento ocurre en esta pestaña; ningún frame se envía a la red.', 'ok');
-    if (mode === 'face' && face.state === 'idle') face.load();
+    if ((mode === 'face' || mode === 'combo') && face.state === 'idle') face.load();
   } catch (err) {
     say(`No se pudo abrir la cámara: ${err?.message ?? err}`, 'bad');
   } finally {
