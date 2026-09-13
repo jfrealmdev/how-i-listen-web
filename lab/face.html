@@ -53,8 +53,7 @@ body {
     rgba(0, 0, 0, 0) 0 2px,
     rgba(0, 0, 0, 0.34) 2px 3px
   );
-  mix-blend-mode: multiply;
-  opacity: 0.5;
+  opacity: 0.22;
 }
 
 #feed {
@@ -254,7 +253,13 @@ button[data-armed="on"] { color: var(--bg); background: var(--accent); }
         <input type="radio" name="mode" value="ink" id="mode-ink">
         <span class="name">Flujo de tinta</span>
         <span class="cost">0 kB · sin ML</span>
-        <span class="note">Partículas que siguen el gradiente de la imagen. Es el efecto de tinta del video de Linkin Park.</span>
+        <span class="note">Trazos continuos que recorren los contornos de la imagen, sembrados donde los bordes son fuertes.</span>
+      </label>
+      <label class="mode">
+        <input type="radio" name="mode" value="liquid" id="mode-liquid">
+        <span class="name">Tinta líquida</span>
+        <span class="cost">0 kB · sin ML</span>
+        <span class="note">Las partículas dejan de ser la imagen: depositan en una capa de densidad que se difumina y decae, y lo que se dibuja es esa capa. La tinta se acumula en las sombras, así que tu rostro aparece como su propio sombreado.</span>
       </label>
       <label class="mode">
         <input type="radio" name="mode" value="face" id="mode-face">
@@ -266,7 +271,7 @@ button[data-armed="on"] { color: var(--bg); background: var(--accent); }
         <input type="radio" name="mode" value="combo" id="mode-combo">
         <span class="name">Tinta sobre el rostro</span>
         <span class="cost">≈7 MB · MediaPipe</span>
-        <span class="note">Las dos juntas: el óvalo de la cara es el molde y la tinta corre dentro antes de derramarse por la mandíbula.</span>
+        <span class="note">La capa de densidad dentro de un molde suave del rostro, con los ojos y la boca calados, y la malla debajo en un 6% para anclar la tinta a una cabeza.</span>
       </label>
     </div>
   </fieldset>
@@ -353,6 +358,8 @@ sampler.height = SAMPLE_H;
 const sctx = sampler.getContext('2d', { willReadFrequently: true });
 
 const lum = new Float32Array(SAMPLE_W * SAMPLE_H);
+let lumMean = 0.5;
+let lumStd = 0.2;
 let rgba = null;
 let haveFrame = false;
 
@@ -368,10 +375,17 @@ function sampleCamera() {
 
   const image = sctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
   rgba = image.data;
+  let sum = 0;
+  let sumSq = 0;
   for (let i = 0, p = 0; i < lum.length; i++, p += 4) {
     // Rec. 601 luma, normalised.
-    lum[i] = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
+    const l = (rgba[p] * 0.299 + rgba[p + 1] * 0.587 + rgba[p + 2] * 0.114) / 255;
+    lum[i] = l;
+    sum += l;
+    sumSq += l * l;
   }
+  lumMean = sum / lum.length;
+  lumStd = Math.sqrt(Math.max(0, sumSq / lum.length - lumMean * lumMean));
   haveFrame = true;
   return true;
 }
@@ -552,29 +566,199 @@ function drawLuminance(w, h, bands, t) {
   return drawn;
 }
 
+/* =========================== shared: the flow field ====================== */
+/* Gradient (Perlin-style) noise, not value noise. Value noise interpolates the
+   lattice values themselves, which leaves discontinuous derivatives and ridges
+   aligned to the grid — and since the velocity here IS a derivative of the
+   noise, those artifacts would be the whole motion, not a cosmetic detail. */
+
+const GRADS = new Float32Array(32);
+for (let i = 0; i < 16; i++) {
+  const a = (i / 16) * Math.PI * 2;
+  GRADS[i * 2] = Math.cos(a);
+  GRADS[i * 2 + 1] = Math.sin(a);
+}
+
+/* Integer mixing hash. The usual sin(x * 43758.5) trick loses precision badly
+   once the arguments grow, which shows up as repeating structure. */
+function hashCorner(x, y) {
+  let h = (Math.imul(x, 374761393) ^ Math.imul(y, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) & 15;
+}
+
+const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+
+function perlin2(x, y) {
+  const xi = Math.floor(x);
+  const yi = Math.floor(y);
+  const xf = x - xi;
+  const yf = y - yi;
+
+  const g00 = hashCorner(xi, yi) * 2;
+  const g10 = hashCorner(xi + 1, yi) * 2;
+  const g01 = hashCorner(xi, yi + 1) * 2;
+  const g11 = hashCorner(xi + 1, yi + 1) * 2;
+
+  const n00 = GRADS[g00] * xf + GRADS[g00 + 1] * yf;
+  const n10 = GRADS[g10] * (xf - 1) + GRADS[g10 + 1] * yf;
+  const n01 = GRADS[g01] * xf + GRADS[g01 + 1] * (yf - 1);
+  const n11 = GRADS[g11] * (xf - 1) + GRADS[g11 + 1] * (yf - 1);
+
+  const u = fade(xf);
+  const v = fade(yf);
+  const a = n00 + u * (n10 - n00);
+  const b = n01 + u * (n11 - n01);
+  return a + v * (b - a);
+}
+
+/* Two octaves of a scalar potential. Curl is linear, so the curl of a sum of
+   potentials is still divergence-free — turbulence for free, and particles
+   never pile into sinks the way they do with noise used directly as velocity. */
+function potential(x, y, t) {
+  return (
+    perlin2(x + t * 0.9, y - t * 0.6) +
+    0.5 * perlin2(x * 2.1 - t * 1.3, y * 2.1 + t * 0.7)
+  );
+}
+
+/* The field is evaluated on a coarse grid once per frame and sampled bilinearly
+   per particle. Evaluating the noise per particle would be eight Perlin lookups
+   each; this is a few hundred for the whole frame. */
+const FIELD_W = 44;
+const FIELD_H = 33;
+const fieldX = new Float32Array(FIELD_W * FIELD_H);
+const fieldY = new Float32Array(FIELD_W * FIELD_H);
+
+/* Space and time are decoupled and time runs fast. A field that drifts slower
+   than a particle's lifetime just hands every particle the same streamline to
+   follow, and streamlines of a frozen field are, by definition, smooth curves
+   that never cross — which is exactly what combed hair looks like. */
+const NOISE_SCALE = 0.9;   // features across the field, not across a cheek
+const NOISE_RATE = 0.35;   // field reorganises in well under a second
+const EPS = 0.04;          // a small fraction of a lattice cell, so this is a derivative
+
+function buildFlowField(seconds) {
+  const t = seconds * NOISE_RATE;
+  for (let gy = 0; gy < FIELD_H; gy++) {
+    for (let gx = 0; gx < FIELD_W; gx++) {
+      const x = (gx / FIELD_W) * NOISE_SCALE * 8;
+      const y = (gy / FIELD_H) * NOISE_SCALE * 6;
+      // curl of a scalar potential: (dPsi/dy, -dPsi/dx)
+      const dy = potential(x, y + EPS, t) - potential(x, y - EPS, t);
+      const dx = potential(x + EPS, y, t) - potential(x - EPS, y, t);
+      const i = gy * FIELD_W + gx;
+      fieldX[i] = dy / (2 * EPS);
+      fieldY[i] = -dx / (2 * EPS);
+    }
+  }
+}
+
+/* Bilinear sample in sampling-canvas coordinates, written into out. */
+function sampleFlow(x, y, out) {
+  const fx = (x / SAMPLE_W) * (FIELD_W - 1);
+  const fy = (y / SAMPLE_H) * (FIELD_H - 1);
+  const x0 = Math.max(0, Math.min(FIELD_W - 2, fx | 0));
+  const y0 = Math.max(0, Math.min(FIELD_H - 2, fy | 0));
+  const tx = fx - x0;
+  const ty = fy - y0;
+  const i00 = y0 * FIELD_W + x0;
+  const i10 = i00 + 1;
+  const i01 = i00 + FIELD_W;
+  const i11 = i01 + 1;
+  const ax = fieldX[i00] + tx * (fieldX[i10] - fieldX[i00]);
+  const bx = fieldX[i01] + tx * (fieldX[i11] - fieldX[i01]);
+  const ay = fieldY[i00] + tx * (fieldY[i10] - fieldY[i00]);
+  const by = fieldY[i01] + tx * (fieldY[i11] - fieldY[i01]);
+  out[0] = ax + ty * (bx - ax);
+  out[1] = ay + ty * (by - ay);
+}
+
+const flowOut = [0, 0];
+
 /* ================================ mode 2: ink flow ====================== */
-/* Particles advected by the luminance gradient, with trails from a partial
-   clear instead of stored history. Cheap, and it is the closest thing here to
-   the liquid-ink passages in the reference video. */
+/* Particles ride the contours of the image: they move perpendicular to the
+   luminance gradient at a speed set by its magnitude, so they settle onto
+   edges. They are seeded where the edges actually are, and each frame draws
+   the segment they travelled rather than a lone dot, so a contour comes out as
+   a continuous stroke instead of a dashed line. */
 
 const INK_MAX = 2600;
-const ink = { x: new Float32Array(INK_MAX), y: new Float32Array(INK_MAX), age: new Float32Array(INK_MAX) };
-let inkSeeded = false;
+const ink = {
+  x: new Float32Array(INK_MAX),
+  y: new Float32Array(INK_MAX),
+  dir: new Float32Array(INK_MAX),  // +1 or -1 along the contour
+  age: new Float32Array(INK_MAX),
+  seeded: false,
+};
 
-function seedInk() {
-  for (let i = 0; i < INK_MAX; i++) respawn(i);
-  inkSeeded = true;
-}
-function respawn(i) {
-  ink.x[i] = Math.random() * SAMPLE_W;
-  ink.y[i] = Math.random() * SAMPLE_H;
-  ink.age[i] = Math.random() * 120;
+/* A cumulative distribution over gradient magnitude, rebuilt a few times a
+   second. Spawning uniformly wastes most particles on flat wall, where there is
+   no contour to trace. */
+const EDGE_CELLS = SAMPLE_W * SAMPLE_H;
+const edgeCdf = new Float32Array(EDGE_CELLS);
+let edgeTotal = 0;
+let edgeBuiltAt = -1e9;
+
+function gradAt(x, y, out) {
+  const xi = Math.max(1, Math.min(SAMPLE_W - 2, x | 0));
+  const yi = Math.max(1, Math.min(SAMPLE_H - 2, y | 0));
+  out[0] = lumAt(xi + 1, yi) - lumAt(xi - 1, yi);
+  out[1] = lumAt(xi, yi + 1) - lumAt(xi, yi - 1);
 }
 
-function drawInk(w, h, bands) {
-  if (!inkSeeded) seedInk();
+const gradOut = [0, 0];
+
+function buildEdgeCdf(seconds) {
+  if (seconds - edgeBuiltAt < 0.25) return;
+  edgeBuiltAt = seconds;
+  let sum = 0;
+  for (let y = 0; y < SAMPLE_H; y++) {
+    for (let x = 0; x < SAMPLE_W; x++) {
+      const i = y * SAMPLE_W + x;
+      if (x < 1 || y < 1 || x > SAMPLE_W - 2 || y > SAMPLE_H - 2) {
+        edgeCdf[i] = sum;
+        continue;
+      }
+      gradAt(x, y, gradOut);
+      // A floor keeps a trickle of particles exploring flat areas.
+      sum += Math.hypot(gradOut[0], gradOut[1]) + 0.004;
+      edgeCdf[i] = sum;
+    }
+  }
+  edgeTotal = sum;
+}
+
+/** Pick a cell with probability proportional to its edge strength. */
+function seedInk(i) {
+  if (edgeTotal <= 0) {
+    ink.x[i] = Math.random() * SAMPLE_W;
+    ink.y[i] = Math.random() * SAMPLE_H;
+  } else {
+    const target = Math.random() * edgeTotal;
+    let lo = 0;
+    let hi = EDGE_CELLS - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (edgeCdf[mid] < target) lo = mid + 1;
+      else hi = mid;
+    }
+    ink.x[i] = (lo % SAMPLE_W) + Math.random();
+    ink.y[i] = ((lo / SAMPLE_W) | 0) + Math.random();
+  }
+  ink.dir[i] = Math.random() < 0.5 ? -1 : 1;
+  ink.age[i] = 0;
+}
+
+function drawInk(w, h, bands, seconds, step) {
+  if (!ink.seeded) {
+    for (let i = 0; i < INK_MAX; i++) seedInk(i);
+    ink.seeded = true;
+  }
+  buildEdgeCdf(seconds);
+
   const count = Math.round(INK_MAX * (0.25 + (17 - params.density) / 17 * 0.75));
-  const speed = 0.6 + bands.level * params.react * 2.4;
+  const speed = (0.5 + bands.level * params.react * 1.6) * step;
 
   const spanX = Math.min(w, h * (4 / 3)) * 0.9;
   const spanY = spanX * 0.75;
@@ -583,40 +767,61 @@ function drawInk(w, h, bands) {
   const sx = spanX / SAMPLE_W;
   const sy = spanY / SAMPLE_H;
 
-  const path = new Path2D();
+  // Strokes are bucketed by weight and stroked once per bucket, so the whole
+  // field costs a handful of draw calls instead of one per particle.
+  const BUCKETS = 4;
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  let drawn = 0;
+
   for (let i = 0; i < count; i++) {
-    const x = ink.x[i];
-    const y = ink.y[i];
-    const gxi = x | 0;
-    const gyi = y | 0;
+    const px = ink.x[i];
+    const py = ink.y[i];
 
-    // Central difference on the luma field; particles slide along the contour
-    // (perpendicular to the gradient) so they trace edges instead of pooling.
-    const gradX = lumAt(gxi + 1, gyi) - lumAt(Math.max(0, gxi - 1), gyi);
-    const gradY = lumAt(gxi, gyi + 1) - lumAt(gxi, Math.max(0, gyi - 1));
-    const mag = Math.hypot(gradX, gradY) || 1e-4;
+    gradAt(px, py, gradOut);
+    const mag = Math.sqrt(gradOut[0] * gradOut[0] + gradOut[1] * gradOut[1]);
 
-    const nx2 = -gradY / mag;
-    const ny2 = gradX / mag;
-    const drift = Math.min(1, mag * 6);
-
-    ink.x[i] += (nx2 * drift + (Math.random() - 0.5) * 0.5) * speed;
-    ink.y[i] += (ny2 * drift + (Math.random() - 0.5) * 0.5) * speed;
+    // Off the contour for too long: this particle is not drawing anything.
+    if (mag < 0.02) ink.age[i] += 4;
     ink.age[i] += 1;
-
-    if (ink.age[i] > 160 || ink.x[i] < 0 || ink.x[i] >= SAMPLE_W || ink.y[i] < 0 || ink.y[i] >= SAMPLE_H) {
-      respawn(i);
+    if (ink.age[i] > 150) {
+      seedInk(i);
       continue;
     }
 
-    const r = 0.6 + lumAt(gxi, gyi) * (1.6 + params.depth / 160);
-    path.moveTo(ox + ink.x[i] * sx + r, oy + ink.y[i] * sy);
-    path.arc(ox + ink.x[i] * sx, oy + ink.y[i] * sy, r, 0, Math.PI * 2);
+    const inv = mag > 1e-4 ? 1 / mag : 0;
+    const tangentX = -gradOut[1] * inv * ink.dir[i];
+    const tangentY = gradOut[0] * inv * ink.dir[i];
+    const pull = Math.min(1, mag * 6);
+
+    // A coherent wobble rather than white noise: jitter that is correlated in
+    // space reads as a hand or a liquid, uncorrelated jitter reads as dither.
+    sampleFlow(px, py, flowOut);
+
+    ink.x[i] += (tangentX * pull + flowOut[0] * 0.18) * speed;
+    ink.y[i] += (tangentY * pull + flowOut[1] * 0.18) * speed;
+
+    if (ink.x[i] < 0 || ink.x[i] >= SAMPLE_W || ink.y[i] < 0 || ink.y[i] >= SAMPLE_H) {
+      seedInk(i);
+      continue;
+    }
+
+    // Weight by how strong the edge is and how dark the ink sits.
+    const weight = Math.min(1, mag * 5) * (1 - lumAt(px | 0, py | 0) * 0.5);
+    const bucket = Math.min(BUCKETS - 1, (weight * BUCKETS) | 0);
+    paths[bucket].moveTo(ox + px * sx, oy + py * sy);
+    paths[bucket].lineTo(ox + ink.x[i] * sx, oy + ink.y[i] * sy);
+    drawn++;
   }
 
-  ctx.fillStyle = `rgba(0, 255, 200, ${0.1 + bands.level * 0.5})`;
-  ctx.fill(path);
-  return count;
+  ctx.lineCap = 'round';
+  for (let b = 0; b < BUCKETS; b++) {
+    const k = (b + 1) / BUCKETS;
+    ctx.strokeStyle = `rgba(${Math.round(40 + k * 140)}, 255, ${Math.round(215 - k * 30)}, ${0.12 + k * (0.25 + bands.level * 0.45)})`;
+    ctx.lineWidth = 0.5 + k * 1.6;
+    ctx.stroke(paths[b]);
+  }
+
+  return drawn;
 }
 
 /* =============================== mode 3: face mesh ====================== */
@@ -830,18 +1035,295 @@ function drawFace(w, h, bands, t) {
   return n;
 }
 
-/* ============================= mode 4: ink on the face =================== */
-/* The two ideas joined: the face oval becomes a stencil, and ink flows inside
-   it along the curl of a noise field before spilling over the jaw. */
+/* ======================= modes 3 and 5: liquid ink ======================= */
+/* The structural difference from the stroke modes: particles are not the
+   image here, they are the carrier. They deposit into a density field, the
+   field is blurred and decayed, and the FIELD is what gets drawn. Blurring is
+   the viscosity — it lets edges bleed the way ink bleeds into paper — and
+   thresholding a blurred density is what turns a cloud of dots into a shape
+   with a boundary. It also retires the translucent-rectangle trail, which on
+   an 8-bit canvas never actually reaches zero and leaves a grey veil behind. */
 
-/* A mask at sampling resolution, refilled on each detection. Testing a point
-   against a polygon per particle per frame would cost far more than one fill. */
+const density = new Float32Array(SAMPLE_W * SAMPLE_H);
+const blurTmp = new Float32Array(SAMPLE_W * SAMPLE_H);
+
+const inkCanvas = document.createElement('canvas');
+inkCanvas.width = SAMPLE_W;
+inkCanvas.height = SAMPLE_H;
+const ictx = inkCanvas.getContext('2d');
+const inkImage = ictx.createImageData(SAMPLE_W, SAMPLE_H);
+
+let inkPeak = 0.2;
+const LIQ_MAX = 4200;
+const liquid = {
+  x: new Float32Array(LIQ_MAX),
+  y: new Float32Array(LIQ_MAX),
+  vx: new Float32Array(LIQ_MAX),
+  vy: new Float32Array(LIQ_MAX),
+  age: new Float32Array(LIQ_MAX),
+  life: new Float32Array(LIQ_MAX),
+  seeded: false,
+};
+
+/* Short lives and slow speeds. Long-lived fast particles each draw one long
+   thin streak; ink reads as many short overlapping marks. */
+const LIFE_MIN = 14;
+const LIFE_SPAN = 46;
+
+function placeLiquid(i, x, y) {
+  liquid.x[i] = x;
+  liquid.y[i] = y;
+  liquid.vx[i] = 0;
+  liquid.vy[i] = 0;
+  liquid.age[i] = Math.random() * LIFE_MIN; // stagger, so they never respawn in cohorts
+  liquid.life[i] = LIFE_MIN + Math.random() * LIFE_SPAN;
+}
+
+/* Seed where the ink belongs: dark areas for the open-frame mode, inside the
+   stencil for the face mode. */
+function seedLiquid(i, masked) {
+  for (let tries = 0; tries < 10; tries++) {
+    const x = Math.random() * SAMPLE_W;
+    const y = Math.random() * SAMPLE_H;
+    if (masked) {
+      if (maskSoftAt(x, y) > 0.35) {
+        placeLiquid(i, x, y);
+        return;
+      }
+    } else if (shadow(x | 0, y | 0) > Math.random() * 0.7) {
+      placeLiquid(i, x, y);
+      return;
+    }
+  }
+  placeLiquid(i, Math.random() * SAMPLE_W, Math.random() * SAMPLE_H);
+  liquid.life[i] = 1; // nothing to hold on to; try again next frame
+}
+
+/** Bilinear splat, so a particle between cells does not shimmer. */
+function splat(x, y, amount) {
+  const xi = x | 0;
+  const yi = y | 0;
+  if (xi < 0 || yi < 0 || xi >= SAMPLE_W - 1 || yi >= SAMPLE_H - 1) return;
+  const tx = x - xi;
+  const ty = y - yi;
+  const i = yi * SAMPLE_W + xi;
+  density[i] += amount * (1 - tx) * (1 - ty);
+  density[i + 1] += amount * tx * (1 - ty);
+  density[i + SAMPLE_W] += amount * (1 - tx) * ty;
+  density[i + SAMPLE_W + 1] += amount * tx * ty;
+}
+
+/** Separable 3-tap blur. This is the bleed. */
+function diffuse() {
+  for (let y = 0; y < SAMPLE_H; y++) {
+    const row = y * SAMPLE_W;
+    for (let x = 0; x < SAMPLE_W; x++) {
+      const i = row + x;
+      const l = x > 0 ? density[i - 1] : density[i];
+      const r = x < SAMPLE_W - 1 ? density[i + 1] : density[i];
+      blurTmp[i] = l * 0.25 + density[i] * 0.5 + r * 0.25;
+    }
+  }
+  for (let y = 0; y < SAMPLE_H; y++) {
+    const row = y * SAMPLE_W;
+    for (let x = 0; x < SAMPLE_W; x++) {
+      const i = row + x;
+      const u = y > 0 ? blurTmp[i - SAMPLE_W] : blurTmp[i];
+      const d = y < SAMPLE_H - 1 ? blurTmp[i + SAMPLE_W] : blurTmp[i];
+      density[i] = u * 0.25 + blurTmp[i] * 0.5 + d * 0.25;
+    }
+  }
+}
+
+/* Decay is per second, not per frame. A per-frame factor makes the trail length
+   depend on the frame rate, so the same code looks different on every phone. */
+function decay(dtSeconds, halfLife) {
+  const k = Math.pow(0.5, dtSeconds / halfLife);
+  for (let i = 0; i < density.length; i++) density[i] *= k;
+}
+
+/* Ink sticks where the frame is darker than its own average rather than darker
+   than absolute black. Absolute darkness makes a dim room paint every pixel and
+   a bright room paint none; relative darkness gives a portrait in both. */
+function shadow(x, y) {
+  // Auto-levelled against the frame's own spread: full ink about one and a half
+  // standard deviations below the mean. The floor stops a flat, low-contrast
+  // frame from turning sensor noise into ink.
+  const rel = (lumMean - lumAt(x, y)) / Math.max(0.09, lumStd * 1.5);
+  return rel > 0 ? (rel > 1 ? 1 : rel) : 0;
+}
+
+const smoothstep = (edge0, edge1, x) => {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+};
+
+/* One pigment, its weight carried by density — which is what reads as ink.
+   Sampling a colour per particle from the camera gives skin browns and greys,
+   i.e. fur. The upscale from 160x120 is free anti-aliasing. */
+function paintDensity(w, h, bands) {
+  const data = inkImage.data;
+
+  // Auto-exposure. How much ink a scene accumulates depends on its contrast,
+  // its lighting and the frame rate, so a fixed threshold is right for exactly
+  // one room. The display range is derived from the field's own peak instead,
+  // smoothed over time so it does not flicker between frames.
+  let peak = 0;
+  let sum = 0;
+  for (let i = 0; i < density.length; i++) {
+    const d = density[i];
+    if (d > peak) peak = d;
+    sum += d;
+  }
+  const mean = sum / density.length;
+  inkPeak += (peak - inkPeak) * 0.06;
+  // The range spans the field's own mean to its own peak, so what shows is the
+  // ink that has POOLED rather than the thin wash that covers everything. A
+  // fraction of the peak alone would still pass most of the frame.
+  const ref = Math.max(0.04, inkPeak);
+  const range = Math.max(0.02, ref - mean);
+  const lo = mean + range * (0.45 - bands.level * 0.15);
+  const hi = mean + range * 0.98;
+  const burn = mean + range * 0.8;
+  let covered = 0;
+
+  for (let i = 0, p = 0; i < density.length; i++, p += 4) {
+    const d = density[i];
+    if (d <= lo) {
+      data[p + 3] = 0;
+      continue;
+    }
+    const a = smoothstep(lo, hi, d);
+    // Thin ink keeps the phosphor hue; where it pools it burns toward white.
+    const k = smoothstep(burn, ref * 1.05, d);
+    data[p] = 20 + k * 215;
+    data[p + 1] = 255;
+    data[p + 2] = 205 - k * 45;
+    data[p + 3] = Math.round(a * (0.55 + bands.level * 0.45) * 255);
+    covered++;
+  }
+
+
+  ictx.putImageData(inkImage, 0, 0);
+  const prev = ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(inkCanvas, 0, 0, w, h);
+  ctx.imageSmoothingEnabled = prev;
+  return covered;
+}
+
+/* Shared simulation. `masked` switches between the open frame and the face
+   stencil; everything else is identical, so the two modes cannot drift apart. */
+function stepLiquid(bands, step, masked) {
+  const count = Math.round(LIQ_MAX * (0.3 + (17 - params.density) / 17 * 0.7));
+  const swirl = (0.22 + bands.level * params.react * 0.5) * step;
+  const drift = (0.25 + bands.mid * params.react * 0.4) * step;
+  const deposit = 0.28 + bands.bass * params.react * 0.22;
+
+  for (let i = 0; i < count; i++) {
+    if (liquid.age[i] >= liquid.life[i]) {
+      seedLiquid(i, masked);
+      continue;
+    }
+
+    const px = liquid.x[i];
+    const py = liquid.y[i];
+    sampleFlow(px, py, flowOut);
+
+    let ax = flowOut[0] * swirl;
+    let ay = flowOut[1] * swirl;
+
+    if (masked) {
+      // A soft stencil instead of a hard in/out test: near the silhouette the
+      // gradient of the blurred mask turns the flow inward, so ink runs along
+      // the jaw rather than stepping through a discontinuity at the edge.
+      const mx = maskSoftAt(px + 1, py) - maskSoftAt(px - 1, py);
+      const my = maskSoftAt(px, py + 1) - maskSoftAt(px, py - 1);
+      ax += mx * 6 * drift;
+      ay += my * 6 * drift;
+    } else {
+      // Ink is drawn toward darkness, so it settles into the shadows.
+      const gx = lumAt((px | 0) + 1, py | 0) - lumAt(Math.max(0, (px | 0) - 1), py | 0);
+      const gy = lumAt(px | 0, (py | 0) + 1) - lumAt(px | 0, Math.max(0, (py | 0) - 1));
+      ax -= gx * 9 * drift;
+      ay -= gy * 9 * drift;
+    }
+
+    liquid.vx[i] = liquid.vx[i] * 0.82 + ax;
+    liquid.vy[i] = liquid.vy[i] * 0.82 + ay;
+    liquid.x[i] += liquid.vx[i];
+    liquid.y[i] += liquid.vy[i];
+    liquid.age[i] += step;
+
+    if (liquid.x[i] < 1 || liquid.x[i] >= SAMPLE_W - 1 || liquid.y[i] < 1 || liquid.y[i] >= SAMPLE_H - 1) {
+      seedLiquid(i, masked);
+      continue;
+    }
+
+    // Luminance decides how much ink STICKS rather than which way it moves.
+    // The ink then becomes the portrait's own shading instead of combing
+    // itself along the lighting ramp, which is what erased the face before.
+    const dark = shadow(liquid.x[i] | 0, liquid.y[i] | 0);
+    let hold = dark * dark;
+    if (masked) hold *= maskSoftAt(liquid.x[i], liquid.y[i]);
+    const fade = 1 - liquid.age[i] / liquid.life[i];
+    splat(liquid.x[i], liquid.y[i], deposit * hold * fade * step);
+  }
+
+  return count;
+}
+
+function drawLiquid(w, h, bands, dtSeconds, step) {
+  if (!liquid.seeded) {
+    for (let i = 0; i < LIQ_MAX; i++) seedLiquid(i, false);
+    liquid.seeded = true;
+  }
+  decay(dtSeconds, 0.8);
+  const count = stepLiquid(bands, step, false);
+  diffuse();
+  paintDensity(w, h, bands);
+  return count;
+}
+
+/* ============================= mode 5: ink on the face =================== */
+
+/* A soft stencil: the oval filled, the eyes and mouth punched out, then
+   blurred. The blur is what gives the edge a gradient to steer by, and the
+   holes are what let a viewer read a face — a gap where an eye belongs is read
+   as an eye long before any of the ink is parsed. */
 const maskCanvas = document.createElement('canvas');
 maskCanvas.width = SAMPLE_W;
 maskCanvas.height = SAMPLE_H;
 const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
-const mask = new Uint8Array(SAMPLE_W * SAMPLE_H);
+const maskSoft = new Float32Array(SAMPLE_W * SAMPLE_H);
+const maskTmp = new Float32Array(SAMPLE_W * SAMPLE_H);
 let maskReady = false;
+
+/* Eye corners and mouth, by landmark index. Feature loops are exposed as
+   connection lists whose ordering is only guaranteed for the face oval, so the
+   holes are punched as discs around named points instead. */
+const LEFT_EYE = [33, 133];
+const RIGHT_EYE = [362, 263];
+const MOUTH = [13, 14];
+
+function markAt(s, index, out) {
+  out[0] = (1 - s[index * 3]) * SAMPLE_W; // mirrored, like the sampled frame
+  out[1] = s[index * 3 + 1] * SAMPLE_H;
+}
+
+const pointA = [0, 0];
+const pointB = [0, 0];
+
+function punch(s, pair, scale) {
+  markAt(s, pair[0], pointA);
+  markAt(s, pair[1], pointB);
+  const cx = (pointA[0] + pointB[0]) / 2;
+  const cy = (pointA[1] + pointB[1]) / 2;
+  const r = Math.max(3, Math.hypot(pointA[0] - pointB[0], pointA[1] - pointB[1]) * scale);
+  mctx.beginPath();
+  mctx.arc(cx, cy, r, 0, Math.PI * 2);
+  mctx.fill();
+}
 
 function buildFaceMask() {
   const s = face.smooth;
@@ -851,9 +1333,11 @@ function buildFaceMask() {
   mctx.fillStyle = '#fff';
   mctx.beginPath();
   let first = true;
+  // FACE_LANDMARKS_FACE_OVAL is an ordered ring in the web build: every entry's
+  // end is the next entry's start. The Java and Python ports expose the same
+  // data as an unordered Set, where walking it like this would scramble.
   for (const conn of face.oval) {
     const a = conn.start ?? conn[0];
-    // Mirrored to match the sampled frame, which is mirrored too.
     const x = (1 - s[a * 3]) * SAMPLE_W;
     const y = s[a * 3 + 1] * SAMPLE_H;
     if (first) { mctx.moveTo(x, y); first = false; }
@@ -862,155 +1346,77 @@ function buildFaceMask() {
   mctx.closePath();
   mctx.fill();
 
+  mctx.globalCompositeOperation = 'destination-out';
+  punch(s, LEFT_EYE, 0.75);
+  punch(s, RIGHT_EYE, 0.75);
+  punch(s, MOUTH, 1.6);
+  mctx.globalCompositeOperation = 'source-over';
+
   const { data } = mctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H);
-  for (let i = 0, p = 3; i < mask.length; i++, p += 4) mask[i] = data[p] > 120 ? 1 : 0;
+  for (let i = 0, p = 3; i < maskSoft.length; i++, p += 4) maskSoft[i] = data[p] / 255;
+
+  // Two separable passes: a hard edge would make the flow jump discontinuously
+  // right at the silhouette, which is visible as a change of behaviour there.
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = 0; y < SAMPLE_H; y++) {
+      const row = y * SAMPLE_W;
+      for (let x = 0; x < SAMPLE_W; x++) {
+        const i = row + x;
+        const l = x > 0 ? maskSoft[i - 1] : maskSoft[i];
+        const r = x < SAMPLE_W - 1 ? maskSoft[i + 1] : maskSoft[i];
+        maskTmp[i] = l * 0.25 + maskSoft[i] * 0.5 + r * 0.25;
+      }
+    }
+    for (let y = 0; y < SAMPLE_H; y++) {
+      const row = y * SAMPLE_W;
+      for (let x = 0; x < SAMPLE_W; x++) {
+        const i = row + x;
+        const u = y > 0 ? maskTmp[i - SAMPLE_W] : maskTmp[i];
+        const d = y < SAMPLE_H - 1 ? maskTmp[i + SAMPLE_W] : maskTmp[i];
+        maskSoft[i] = u * 0.25 + maskTmp[i] * 0.5 + d * 0.25;
+      }
+    }
+  }
   maskReady = true;
 }
 
-const inFace = (x, y) => {
+function maskSoftAt(x, y) {
   const xi = x | 0;
   const yi = y | 0;
   if (xi < 0 || yi < 0 || xi >= SAMPLE_W || yi >= SAMPLE_H) return 0;
-  return mask[yi * SAMPLE_W + xi];
-};
-
-/* Cheap value noise. Two offset samples give a divergence-free (curl) field,
-   which is what makes the drift look like liquid instead of drifting dust. */
-function hash2(x, y) {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-  return s - Math.floor(s);
-}
-function valueNoise(x, y) {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const xf = x - xi;
-  const yf = y - yi;
-  const u = xf * xf * (3 - 2 * xf);
-  const v = yf * yf * (3 - 2 * yf);
-  const a = hash2(xi, yi);
-  const b = hash2(xi + 1, yi);
-  const c = hash2(xi, yi + 1);
-  const d = hash2(xi + 1, yi + 1);
-  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
-}
-function curl(x, y, out) {
-  const e = 0.6;
-  const n1 = valueNoise(x, y + e);
-  const n2 = valueNoise(x, y - e);
-  const n3 = valueNoise(x + e, y);
-  const n4 = valueNoise(x - e, y);
-  out[0] = (n1 - n2) / (2 * e);
-  out[1] = -(n3 - n4) / (2 * e);
+  return maskSoft[yi * SAMPLE_W + xi];
 }
 
-const COMBO_MAX = 3000;
-const combo = {
-  x: new Float32Array(COMBO_MAX),
-  y: new Float32Array(COMBO_MAX),
-  vx: new Float32Array(COMBO_MAX),
-  vy: new Float32Array(COMBO_MAX),
-  age: new Float32Array(COMBO_MAX),
-  life: new Float32Array(COMBO_MAX),
-  seeded: false,
-};
-const curlOut = [0, 0];
-
-function seedCombo(i) {
-  // Rejection-sample inside the stencil so ink is born on the face, not around it.
-  for (let tries = 0; tries < 12; tries++) {
-    const x = Math.random() * SAMPLE_W;
-    const y = Math.random() * SAMPLE_H;
-    if (inFace(x, y)) {
-      combo.x[i] = x;
-      combo.y[i] = y;
-      combo.vx[i] = 0;
-      combo.vy[i] = 0;
-      combo.age[i] = 0;
-      combo.life[i] = 60 + Math.random() * 120;
-      return;
-    }
-  }
-  combo.life[i] = 0; // No face yet; try again next frame.
-  combo.age[i] = 1;
-}
-
-function drawCombo(w, h, bands, t) {
+function drawCombo(w, h, bands, dtSeconds, step) {
   if (!maskReady || !face.tracking) return 0;
-  if (!combo.seeded) {
-    for (let i = 0; i < COMBO_MAX; i++) seedCombo(i);
-    combo.seeded = true;
+  if (!liquid.seeded) {
+    for (let i = 0; i < LIQ_MAX; i++) seedLiquid(i, true);
+    liquid.seeded = true;
   }
 
-  const count = Math.round(COMBO_MAX * (0.3 + (17 - params.density) / 17 * 0.7));
-  const flow = 0.35 + bands.level * params.react * 0.9;
-  const drip = 0.05 + bands.bass * params.react * 0.35; // Bass makes the ink run.
-  const noiseScale = 0.05;
-  const drag = 0.86;
-
-  const { sx, sy, cx, cy } = faceProjection(w, h);
-  const toScreenX = (x) => cx + ((0.5 - x / SAMPLE_W) * 2) * sx;
-  const toScreenY = (y) => cy + ((y / SAMPLE_H - 0.5) * 2) * sy;
-
-  ctx.lineCap = 'round';
-  let alive = 0;
-
-  for (let i = 0; i < count; i++) {
-    if (combo.life[i] <= 0 || combo.age[i] > combo.life[i]) {
-      seedCombo(i);
-      continue;
+  // The mesh underneath, faint: it anchors the ink to a head, so a viewer reads
+  // a face before they start parsing the ink.
+  const proj = projectFace(w, h, bands, 0);
+  if (proj && face.tesselation) {
+    const wire = new Path2D();
+    const { xy, n } = proj;
+    for (const conn of face.tesselation) {
+      const a = conn.start ?? conn[0];
+      const b = conn.end ?? conn[1];
+      if (a >= n || b >= n) continue;
+      wire.moveTo(xy[a * 2], xy[a * 2 + 1]);
+      wire.lineTo(xy[b * 2], xy[b * 2 + 1]);
     }
-
-    const px = combo.x[i];
-    const py = combo.y[i];
-
-    curl(px * noiseScale, py * noiseScale + t * 0.0004, curlOut);
-
-    // Inside the stencil the ink also hugs the features; outside it just falls.
-    const held = inFace(px, py);
-    let ax = curlOut[0] * flow;
-    let ay = curlOut[1] * flow + drip;
-    if (held) {
-      const gx = lumAt((px | 0) + 1, py | 0) - lumAt(Math.max(0, (px | 0) - 1), py | 0);
-      const gy = lumAt(px | 0, (py | 0) + 1) - lumAt(px | 0, Math.max(0, (py | 0) - 1));
-      const mag = Math.hypot(gx, gy) || 1e-4;
-      ax += (-gy / mag) * Math.min(1, mag * 5) * flow;
-      ay += (gx / mag) * Math.min(1, mag * 5) * flow;
-    }
-
-    // Velocity carried between frames is what turns crawling dots into ribbons.
-    combo.vx[i] = combo.vx[i] * drag + ax;
-    combo.vy[i] = combo.vy[i] * drag + ay;
-    combo.x[i] += combo.vx[i];
-    combo.y[i] += combo.vy[i];
-    combo.age[i] += 1;
-
-    if (combo.x[i] < 0 || combo.x[i] >= SAMPLE_W || combo.y[i] < 0 || combo.y[i] >= SAMPLE_H) {
-      seedCombo(i);
-      continue;
-    }
-
-    // Ink that has left the face fades as it falls, so the spill has an edge.
-    const fade = held ? 1 : 0.45;
-    const remaining = 1 - combo.age[i] / combo.life[i];
-
-    let colour;
-    if (rgba) {
-      const o = ((combo.y[i] | 0) * SAMPLE_W + (combo.x[i] | 0)) * 4;
-      colour = `rgba(${rgba[o]}, ${rgba[o + 1]}, ${rgba[o + 2]}, ${(0.25 + bands.level * 0.5) * fade * remaining})`;
-    } else {
-      colour = `rgba(0, 255, 200, ${0.3 * fade * remaining})`;
-    }
-
-    ctx.strokeStyle = colour;
-    ctx.lineWidth = (0.6 + bands.treble * params.react) * fade;
-    ctx.beginPath();
-    ctx.moveTo(toScreenX(px), toScreenY(py));
-    ctx.lineTo(toScreenX(combo.x[i]), toScreenY(combo.y[i]));
-    ctx.stroke();
-    alive++;
+    ctx.strokeStyle = 'rgba(0, 255, 200, 0.06)';
+    ctx.lineWidth = 0.5;
+    ctx.stroke(wire);
   }
 
-  return alive;
+  decay(dtSeconds, 0.9);
+  const count = stepLiquid(bands, step, true);
+  diffuse();
+  paintDensity(w, h, bands);
+  return count;
 }
 
 /* ----------------------------------------------------------------- loop --- */
@@ -1043,13 +1449,22 @@ function frame(now) {
   const h = view.height;
   const bands = audio.sample();
 
+  // Everything below moves in units of a 60 fps frame, so a slow phone shows
+  // the same motion more coarsely instead of a different effect entirely.
+  const dtSeconds = dt / 1000;
+  const step = Math.min(3, dt / 16.67);
+
   // The mesh alone reads the video element directly and needs no readback.
   if (mode !== 'face') sampleCamera();
   if (mode === 'face' || mode === 'combo') face.detect(now);
+  if (mode === 'ink' || mode === 'liquid' || mode === 'combo') buildFlowField(now / 1000);
 
-  // Trails for the flowing modes, a hard clear for the rest.
-  if (mode === 'ink' || mode === 'combo') {
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.14)';
+  // Only the stroke mode leans on a translucent clear, and its alpha is
+  // corrected for the real frame time. The liquid modes hold their own history
+  // in the density field and clear outright.
+  if (mode === 'ink') {
+    const a = 1 - Math.pow(1 - 0.14, step);
+    ctx.fillStyle = `rgba(0, 0, 0, ${a})`;
     ctx.fillRect(0, 0, w, h);
   } else {
     ctx.fillStyle = '#000';
@@ -1062,9 +1477,11 @@ function frame(now) {
   } else if (mode === 'lum') {
     points = drawLuminance(w, h, bands, now);
   } else if (mode === 'ink') {
-    points = drawInk(w, h, bands);
+    points = drawInk(w, h, bands, now / 1000, step);
+  } else if (mode === 'liquid') {
+    points = drawLiquid(w, h, bands, dtSeconds, step);
   } else if (mode === 'combo') {
-    points = drawCombo(w, h, bands, now);
+    points = drawCombo(w, h, bands, dtSeconds, step);
     if (face.state === 'ready' && !face.tracking) drawHint(w, h, 'Buscando un rostro…');
   } else {
     points = drawFace(w, h, bands, now);
