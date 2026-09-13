@@ -721,8 +721,15 @@ function buildEdgeCdf(seconds) {
         continue;
       }
       gradAt(x, y, gradOut);
+      // Weighted toward the middle of the frame. The gradient alone cannot tell
+      // a face from the picture frames on the wall behind it, and whoever is
+      // using this is the thing in the centre.
+      const nx = x / SAMPLE_W - 0.5;
+      const ny = y / SAMPLE_H - 0.5;
+      const r2 = nx * nx * 1.44 + ny * ny * 1.82;
+      const vignette = 0.18 + 0.82 * Math.max(0, 1 - r2 * 3.2);
       // A floor keeps a trickle of particles exploring flat areas.
-      sum += Math.hypot(gradOut[0], gradOut[1]) + 0.004;
+      sum += (Math.hypot(gradOut[0], gradOut[1]) + 0.004) * vignette;
       edgeCdf[i] = sum;
     }
   }
@@ -758,7 +765,11 @@ function drawInk(w, h, bands, seconds, step) {
   buildEdgeCdf(seconds);
 
   const count = Math.round(INK_MAX * (0.25 + (17 - params.density) / 17 * 0.75));
-  const speed = (0.5 + bands.level * params.react * 1.6) * step;
+  // Audio drives agitation, not translation. Scaling the travel speed made a
+  // loud passage fling particles off the contour they were meant to trace, so
+  // every screenshot taken with music playing showed the effect at its worst.
+  const speed = (0.85 + bands.level * params.react * 0.18) * step;
+  const turbulence = 0.1 + bands.treble * params.react * 0.28;
 
   const spanX = Math.min(w, h * (4 / 3)) * 0.9;
   const spanY = spanX * 0.75;
@@ -769,8 +780,8 @@ function drawInk(w, h, bands, seconds, step) {
 
   // Strokes are bucketed by weight and stroked once per bucket, so the whole
   // field costs a handful of draw calls instead of one per particle.
-  const BUCKETS = 4;
-  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  const BUCKETS = 5;
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D(), new Path2D()];
   let drawn = 0;
 
   for (let i = 0; i < count; i++) {
@@ -795,18 +806,23 @@ function drawInk(w, h, bands, seconds, step) {
 
     // A coherent wobble rather than white noise: jitter that is correlated in
     // space reads as a hand or a liquid, uncorrelated jitter reads as dither.
+    // It is scaled by the contour's own pull, because at full strength it threw
+    // particles that had lost their edge straight outward — the spikes.
     sampleFlow(px, py, flowOut);
+    const wobble = turbulence * pull;
 
-    ink.x[i] += (tangentX * pull + flowOut[0] * 0.18) * speed;
-    ink.y[i] += (tangentY * pull + flowOut[1] * 0.18) * speed;
+    ink.x[i] += (tangentX * pull + flowOut[0] * wobble) * speed;
+    ink.y[i] += (tangentY * pull + flowOut[1] * wobble) * speed;
 
     if (ink.x[i] < 0 || ink.x[i] >= SAMPLE_W || ink.y[i] < 0 || ink.y[i] >= SAMPLE_H) {
       seedInk(i);
       continue;
     }
 
-    // Weight by how strong the edge is and how dark the ink sits.
-    const weight = Math.min(1, mag * 5) * (1 - lumAt(px | 0, py | 0) * 0.5);
+    // Weight by how strong the edge is. The curve is steeper than before so a
+    // real contour clearly outranks the faint texture of a wall, and the widths
+    // it selects now span a real range rather than half a pixel.
+    const weight = Math.min(1, mag * mag * 26);
     const bucket = Math.min(BUCKETS - 1, (weight * BUCKETS) | 0);
     paths[bucket].moveTo(ox + px * sx, oy + py * sy);
     paths[bucket].lineTo(ox + ink.x[i] * sx, oy + ink.y[i] * sy);
@@ -816,8 +832,8 @@ function drawInk(w, h, bands, seconds, step) {
   ctx.lineCap = 'round';
   for (let b = 0; b < BUCKETS; b++) {
     const k = (b + 1) / BUCKETS;
-    ctx.strokeStyle = `rgba(${Math.round(40 + k * 140)}, 255, ${Math.round(215 - k * 30)}, ${0.12 + k * (0.25 + bands.level * 0.45)})`;
-    ctx.lineWidth = 0.5 + k * 1.6;
+    ctx.strokeStyle = `rgba(${Math.round(30 + k * 170)}, 255, ${Math.round(220 - k * 35)}, ${0.10 + k * (0.3 + bands.level * 0.5)})`;
+    ctx.lineWidth = 0.35 + k * k * 2.9;
     ctx.stroke(paths[b]);
   }
 
@@ -1054,6 +1070,8 @@ const ictx = inkCanvas.getContext('2d');
 const inkImage = ictx.createImageData(SAMPLE_W, SAMPLE_H);
 
 let inkPeak = 0.2;
+const HIST_BINS = 64;
+const HIST = new Uint32Array(HIST_BINS);
 const LIQ_MAX = 4200;
 const liquid = {
   x: new Float32Array(LIQ_MAX),
@@ -1079,24 +1097,46 @@ function placeLiquid(i, x, y) {
   liquid.life[i] = LIFE_MIN + Math.random() * LIFE_SPAN;
 }
 
-/* Seed where the ink belongs: dark areas for the open-frame mode, inside the
-   stencil for the face mode. */
-function seedLiquid(i, masked) {
-  for (let tries = 0; tries < 10; tries++) {
-    const x = Math.random() * SAMPLE_W;
-    const y = Math.random() * SAMPLE_H;
-    if (masked) {
-      if (maskSoftAt(x, y) > 0.35) {
-        placeLiquid(i, x, y);
-        return;
-      }
-    } else if (shadow(x | 0, y | 0) > Math.random() * 0.7) {
-      placeLiquid(i, x, y);
-      return;
+/* Seeding used to reject-sample: draw a random point, keep it if it was dark
+   enough, give up after ten tries and drop the particle with a lifetime of one
+   frame. In a bright room almost every particle took that path and deposited
+   nothing, while the HUD counted it as alive. This builds a distribution over
+   the frame instead, so a seed always lands somewhere ink belongs. */
+const seedCdf = new Float32Array(SAMPLE_W * SAMPLE_H);
+let seedTotal = 0;
+let seedBuiltAt = -1e9;
+let seedMasked = false;
+
+function buildSeedCdf(seconds, masked) {
+  if (seconds - seedBuiltAt < 0.2 && masked === seedMasked) return;
+  seedBuiltAt = seconds;
+  seedMasked = masked;
+  let sum = 0;
+  for (let y = 0; y < SAMPLE_H; y++) {
+    for (let x = 0; x < SAMPLE_W; x++) {
+      let weight = shadow(x, y) + 0.02;
+      if (masked) weight *= maskSoftAt(x, y);
+      sum += weight;
+      seedCdf[y * SAMPLE_W + x] = sum;
     }
   }
-  placeLiquid(i, Math.random() * SAMPLE_W, Math.random() * SAMPLE_H);
-  liquid.life[i] = 1; // nothing to hold on to; try again next frame
+  seedTotal = sum;
+}
+
+function seedLiquid(i, masked) {
+  if (seedTotal <= 0) {
+    placeLiquid(i, Math.random() * SAMPLE_W, Math.random() * SAMPLE_H);
+    return;
+  }
+  const target = Math.random() * seedTotal;
+  let lo = 0;
+  let hi = seedCdf.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (seedCdf[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  placeLiquid(i, (lo % SAMPLE_W) + Math.random(), ((lo / SAMPLE_W) | 0) + Math.random());
 }
 
 /** Bilinear splat, so a particle between cells does not shimmer. */
@@ -1113,7 +1153,12 @@ function splat(x, y, amount) {
   density[i + SAMPLE_W + 1] += amount * tx * ty;
 }
 
-/** Separable 3-tap blur. This is the bleed. */
+/* Separable 3-tap blur, mixed in by a fraction. This is the bleed — but it
+   compounds: ink lives for roughly a half-life of 48 frames, so a full blur
+   every frame is forty-odd blurs stacked, and no detail survives that. Mixing
+   a fraction spreads the same ink over the same time without erasing it. */
+const BLEED = 0.13;
+
 function diffuse() {
   for (let y = 0; y < SAMPLE_H; y++) {
     const row = y * SAMPLE_W;
@@ -1130,7 +1175,8 @@ function diffuse() {
       const i = row + x;
       const u = y > 0 ? blurTmp[i - SAMPLE_W] : blurTmp[i];
       const d = y < SAMPLE_H - 1 ? blurTmp[i + SAMPLE_W] : blurTmp[i];
-      density[i] = u * 0.25 + blurTmp[i] * 0.5 + d * 0.25;
+      const blurred = u * 0.25 + blurTmp[i] * 0.5 + d * 0.25;
+      density[i] += (blurred - density[i]) * BLEED;
     }
   }
 }
@@ -1169,22 +1215,33 @@ function paintDensity(w, h, bands) {
   // one room. The display range is derived from the field's own peak instead,
   // smoothed over time so it does not flicker between frames.
   let peak = 0;
-  let sum = 0;
+  for (let i = 0; i < density.length; i++) if (density[i] > peak) peak = density[i];
+  inkPeak += (peak - inkPeak) * 0.06;
+  const ref = Math.max(0.02, inkPeak);
+
+  // The threshold is a percentile of the field, not a fraction of its peak or
+  // its mean. Those both depend on the shape of the distribution, which depends
+  // on the room: tuning them against one scene mistunes them for every other.
+  // Asking for "the densest sixth of the frame" holds in a bright room and a
+  // dim one alike, and leaves nothing to calibrate by hand.
+  HIST.fill(0);
+  const scale = (HIST_BINS - 1) / ref;
   for (let i = 0; i < density.length; i++) {
     const d = density[i];
-    if (d > peak) peak = d;
-    sum += d;
+    if (d <= 0) continue;
+    const bin = Math.min(HIST_BINS - 1, (d * scale) | 0);
+    HIST[bin]++;
   }
-  const mean = sum / density.length;
-  inkPeak += (peak - inkPeak) * 0.06;
-  // The range spans the field's own mean to its own peak, so what shows is the
-  // ink that has POOLED rather than the thin wash that covers everything. A
-  // fraction of the peak alone would still pass most of the frame.
-  const ref = Math.max(0.04, inkPeak);
-  const range = Math.max(0.02, ref - mean);
-  const lo = mean + range * (0.45 - bands.level * 0.15);
-  const hi = mean + range * 0.98;
-  const burn = mean + range * 0.8;
+  const target = density.length * (0.11 + bands.level * 0.07);
+  let seen = 0;
+  let cut = HIST_BINS - 1;
+  while (cut > 0 && seen < target) {
+    seen += HIST[cut];
+    cut--;
+  }
+  const lo = (cut / (HIST_BINS - 1)) * ref;
+  const hi = ref * 0.92;
+  const burn = lo + (hi - lo) * 0.62;
   let covered = 0;
 
   for (let i = 0, p = 0; i < density.length; i++, p += 4) {
@@ -1216,9 +1273,13 @@ function paintDensity(w, h, bands) {
    stencil; everything else is identical, so the two modes cannot drift apart. */
 function stepLiquid(bands, step, masked) {
   const count = Math.round(LIQ_MAX * (0.3 + (17 - params.density) / 17 * 0.7));
-  const swirl = (0.22 + bands.level * params.react * 0.5) * step;
-  const drift = (0.25 + bands.mid * params.react * 0.4) * step;
-  const deposit = 0.28 + bands.bass * params.react * 0.22;
+  // Travel stays steady and the audio agitates instead: louder means more
+  // turbulence and more pigment released, not particles racing across the frame
+  // smearing their deposit too thin to ever cross the display threshold.
+  const swirl = (0.3 + bands.treble * params.react * 0.22) * step;
+  const drift = 0.4 * step;
+  const deposit = 0.3 + bands.bass * params.react * 0.4;
+  let depositing = 0;
 
   for (let i = 0; i < count; i++) {
     if (liquid.age[i] >= liquid.life[i]) {
@@ -1263,17 +1324,25 @@ function stepLiquid(bands, step, masked) {
     // Luminance decides how much ink STICKS rather than which way it moves.
     // The ink then becomes the portrait's own shading instead of combing
     // itself along the lighting ramp, which is what erased the face before.
+    // Linear, not squared. Squaring gave a dark room pleasing contrast and a
+    // bright one almost no ink at all: a face sitting 0.3 below its own mean
+    // held 0.09 of the pigment, which is nothing.
     const dark = shadow(liquid.x[i] | 0, liquid.y[i] | 0);
-    let hold = dark * dark;
+    let hold = dark;
     if (masked) hold *= maskSoftAt(liquid.x[i], liquid.y[i]);
     const fade = 1 - liquid.age[i] / liquid.life[i];
-    splat(liquid.x[i], liquid.y[i], deposit * hold * fade * step);
+    const amount = deposit * hold * fade * step;
+    if (amount > 0.002) depositing++;
+    splat(liquid.x[i], liquid.y[i], amount);
   }
 
-  return count;
+  // The count the HUD used to show was how many particles were walked, not how
+  // many left any ink. In a bright room those were wildly different numbers.
+  return depositing;
 }
 
-function drawLiquid(w, h, bands, dtSeconds, step) {
+function drawLiquid(w, h, bands, dtSeconds, step, seconds) {
+  buildSeedCdf(seconds, false);
   if (!liquid.seeded) {
     for (let i = 0; i < LIQ_MAX; i++) seedLiquid(i, false);
     liquid.seeded = true;
@@ -1387,8 +1456,9 @@ function maskSoftAt(x, y) {
   return maskSoft[yi * SAMPLE_W + xi];
 }
 
-function drawCombo(w, h, bands, dtSeconds, step) {
+function drawCombo(w, h, bands, dtSeconds, step, seconds) {
   if (!maskReady || !face.tracking) return 0;
+  buildSeedCdf(seconds, true);
   if (!liquid.seeded) {
     for (let i = 0; i < LIQ_MAX; i++) seedLiquid(i, true);
     liquid.seeded = true;
@@ -1479,9 +1549,9 @@ function frame(now) {
   } else if (mode === 'ink') {
     points = drawInk(w, h, bands, now / 1000, step);
   } else if (mode === 'liquid') {
-    points = drawLiquid(w, h, bands, dtSeconds, step);
+    points = drawLiquid(w, h, bands, dtSeconds, step, now / 1000);
   } else if (mode === 'combo') {
-    points = drawCombo(w, h, bands, dtSeconds, step);
+    points = drawCombo(w, h, bands, dtSeconds, step, now / 1000);
     if (face.state === 'ready' && !face.tracking) drawHint(w, h, 'Buscando un rostro…');
   } else {
     points = drawFace(w, h, bands, now);
